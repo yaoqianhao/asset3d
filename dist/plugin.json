@@ -1,0 +1,160 @@
+{
+  "capabilities": [
+    "fs.read",
+    "fs.write",
+    "progress"
+  ],
+  "commands": [],
+  "description": "把 FBX / glTF 资产解析成引擎内核可直接消费的 AIR 数据，支持二进制/JSON 导出、离线 HTML+数据分片预览与批量清单。",
+  "id": "asset3d",
+  "main": "asset3d.exe",
+  "name": "3D 资产导入（AIR）",
+  "pluginApi": "1.0",
+  "subscriptions": [],
+  "timeoutMs": 120000,
+  "tools": [
+    {
+      "description": "解析工作区内的 .fbx / .glb / .gltf 三维资产，输出 AIR 摘要（网格、材质、贴图、骨骼、动画、包围盒）与导入期问题清单。只读，不写盘。",
+      "name": "inspect_asset",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "animations": {
+            "description": "是否解析动画轨道，默认 true",
+            "type": "boolean"
+          },
+          "embedTextures": {
+            "description": "是否把贴图字节读进 AIR，默认 false（摘要里只报尺寸）",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "资产路径：工作区相对路径或工作区内绝对路径",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "risk": "read"
+    },
+    {
+      "description": "把 .fbx / .glb / .gltf 导入成引擎内核可直接消费的 AIR：导出 .air.bin（AIRB 二进制，几何平铺可直灌顶点缓冲）或 .air.json（便于 diff 与手改）。写盘后立即回读校验。",
+      "name": "export_asset",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "animations": {
+            "description": "是否导出动画轨道，默认 true",
+            "type": "boolean"
+          },
+          "embedTextures": {
+            "description": "是否把贴图以 base64 内嵌进 AIR，默认 false",
+            "type": "boolean"
+          },
+          "format": {
+            "description": "导出格式，默认 both",
+            "enum": [
+              "bin",
+              "json",
+              "both"
+            ],
+            "type": "string"
+          },
+          "out": {
+            "description": "输出路径；省略时写到源文件同目录、同名的 .air.bin / .air.json",
+            "type": "string"
+          },
+          "path": {
+            "description": "源资产路径",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "pathField": "path",
+      "risk": "write"
+    },
+    {
+      "description": "生成离线可打开的预览：薄 HTML（模板/索引/元数据）+ 若干 .shard.NN.js 数据分片，浏览器或 Electron 直接打开，无需服务器。只画静态网格与材质（轨道相机、节点层级世界矩阵、贴图、统计面板），不播放骨骼动画、不做蒙皮变形；分片需与 HTML 同目录。",
+      "name": "preview_asset",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "maxTriangles": {
+            "description": "预览三角形预算，超出时先整网格丢弃、只剩一个网格则截断索引，并在页面标注，默认 400000；0 表示不限制",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "out": {
+            "description": "HTML 输出路径；省略时写到源文件同目录、同名的 .preview.html",
+            "type": "string"
+          },
+          "path": {
+            "description": "源资产路径",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "pathField": "path",
+      "risk": "write"
+    },
+    {
+      "description": "递归扫描工作区目录，列出所有 .fbx / .glb / .gltf 资产及体积，便于批量导入前先摸清家底。",
+      "name": "list_assets",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "dir": {
+            "description": "起始目录（工作区相对），默认工作区根",
+            "type": "string"
+          },
+          "limit": {
+            "description": "最多返回多少个文件，默认 200",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "recursive": {
+            "description": "是否递归子目录，默认 true",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "risk": "read"
+    },
+    {
+      "description": "把引擎侧读取 AIR/AIRB 的 Rust 加载器源码写到指定路径（纯 std + serde，可直接放进 r3e-asset 一类的 crate 使用），并附带格式说明。",
+      "name": "export_engine_loader",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "out": {
+            "description": "目标 .rs 路径，例如 src/air_loader.rs",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "description": "目标已存在时是否覆盖，默认 false",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "out"
+        ],
+        "type": "object"
+      },
+      "pathField": "out",
+      "risk": "write"
+    }
+  ],
+  "version": "0.2.0"
+}

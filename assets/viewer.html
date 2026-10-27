@@ -1,0 +1,756 @@
+<!doctype html>
+<!-- 数据分片（必须与本文件同目录，按序号 include）：__AIR_SHARD_LIST__ -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__AIR_TITLE__ · AIR 预览</title>
+<style>
+  :root {
+    --bg: #101216;
+    --panel: rgba(20, 23, 29, 0.92);
+    --line: #2a2f3a;
+    --text: #d5dae3;
+    --dim: #8b93a1;
+    --accent: #5aa9ff;
+    --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); }
+  body {
+    font: 12px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  #gl { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  #gl.dragging { cursor: grabbing; }
+  .panel {
+    position: fixed;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    backdrop-filter: blur(6px);
+    user-select: none;
+  }
+  #hud { top: 12px; left: 12px; min-width: 230px; max-width: 340px; }
+  #hud h1 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: #fff; word-break: break-all; }
+  #hud .meta { color: var(--dim); margin-bottom: 8px; word-break: break-all; }
+  #hud table { border-collapse: collapse; width: 100%; }
+  #hud td { padding: 1px 0; vertical-align: top; }
+  #hud td.k { color: var(--dim); width: 84px; }
+  #hud td.v { color: var(--text); font-variant-numeric: tabular-nums; }
+  #notes { top: 12px; right: 12px; width: 300px; max-height: 44vh; overflow: auto; }
+  #notes h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--warn); }
+  #notes ul { margin: 0; padding-left: 16px; color: var(--dim); }
+  #notes li { margin: 2px 0; word-break: break-word; }
+  #hint {
+    left: 50%; transform: translateX(-50%); bottom: 12px;
+    color: var(--dim); font-size: 11px; padding: 6px 12px;
+  }
+  #hint b { color: var(--text); font-weight: 600; }
+  #fallback {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    padding: 40px; text-align: center; color: var(--warn); font-size: 14px;
+  }
+  #loadfail {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    padding: 40px; background: rgba(16, 18, 22, 0.96); z-index: 20;
+  }
+  #loadfail .box {
+    max-width: 640px; border: 1px solid var(--line); border-radius: 10px;
+    padding: 20px 24px; background: var(--panel);
+  }
+  #loadfail h2 { margin: 0 0 8px; font-size: 15px; color: var(--warn); }
+  #loadfail p { margin: 0; color: var(--dim); word-break: break-word; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="hud" class="panel">
+  <h1 id="title">__AIR_TITLE__</h1>
+  <div class="meta" id="meta"></div>
+  <table id="stats"></table>
+</div>
+
+<div id="notes" class="panel hidden">
+  <h2>生成期提示</h2>
+  <ul id="issues"></ul>
+</div>
+
+<div id="hint" class="panel">
+  <b>左键</b>旋转 &nbsp;<b>滚轮</b>缩放 &nbsp;<b>右键</b>平移 &nbsp;<b>R</b>复位视角
+</div>
+
+<div id="fallback">当前环境不支持 WebGL，无法显示预览。请改用桌面浏览器，或查看导出的 .air.json。</div>
+
+<div id="loadfail">
+  <div class="box">
+    <h2 id="loadfail-title">预览数据未能载入</h2>
+    <p id="loadfail-detail"></p>
+  </div>
+</div>
+
+<!-- 数据分片：与 HTML 同目录，按序号顺序 include，file:// 下也能直接加载。 -->
+<script>window.__AIR_SHARDS__ = [];</script>
+__AIR_SHARD_SCRIPTS__
+
+<script>
+"use strict";
+/* 数据来自 asset3d 插件：坐标已归一化为右手系 / +Y up / +Z front / 单位米 / CCW。
+   几何/材质/贴图不在本 HTML 里，而是拆成了 __AIR_SHARD_LIST__（须与本文件同目录）。
+   页面只负责合并分片 + 渲染，所以单文件始终很小。 */
+const SHARD_META = __AIR_SHARD_META__;
+
+function failPage(title, detail) {
+  const box = document.getElementById("loadfail");
+  document.getElementById("loadfail-title").textContent = title;
+  document.getElementById("loadfail-detail").textContent = detail;
+  if (box) box.style.display = "flex";
+  const hud = document.getElementById("hud");
+  if (hud) hud.classList.add("hidden");
+  const hint = document.getElementById("hint");
+  if (hint) hint.classList.add("hidden");
+}
+
+/* 合并分片：校验「应到 vs 实到」，缺片直接说清缺哪个文件，而不是白屏。 */
+function loadAir() {
+  const files = (SHARD_META && Array.isArray(SHARD_META.files)) ? SHARD_META.files : [];
+  const expected = files.length;
+  const received = Array.isArray(window.__AIR_SHARDS__) ? window.__AIR_SHARDS__ : [];
+  const byIndex = new Map();
+  for (const shard of received) {
+    if (!shard || typeof shard.i !== "number" || typeof shard.t !== "string") continue;
+    byIndex.set(shard.i, shard.t);
+  }
+  const missing = [];
+  for (let i = 1; i <= expected; i++) {
+    if (!byIndex.has(i)) missing.push(files[i - 1] || ("第 " + i + " 片"));
+  }
+  if (expected === 0) {
+    // 这里不能再写 __AIR_SHARD_META__ 占位符：它会被替换成裸 JSON，把整段脚本变成语法错误（整页白屏）。
+    failPage("缺少分片索引", "HTML 里没有分片清单（SHARD_META.files 为空）。请重新运行 preview_asset。");
+    return null;
+  }
+  if (missing.length) {
+    failPage(
+      "数据分片缺失 " + missing.length + " / " + expected,
+      "缺少：" + missing.join("、") + "。分片必须与 HTML 放在同一目录且文件名不可改；请重新运行 preview_asset 生成完整的一组文件。"
+    );
+    return null;
+  }
+  let text = "";
+  for (let i = 1; i <= expected; i++) text += byIndex.get(i);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    failPage("数据分片损坏", "分片合并后不是合法 JSON：" + err.message + "；请重新运行 preview_asset。");
+    return null;
+  }
+}
+
+const AIR = loadAir();
+if (!AIR) throw new Error("AIR payload unavailable");
+
+/* ---------------- 矩阵 ---------------- */
+const M4 = {
+  identity() {
+    return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  },
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) {
+      for (let r = 0; r < 4; r++) {
+        let s = 0;
+        for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+        o[c * 4 + r] = s;
+      }
+    }
+    return o;
+  },
+  trs(t, q, s) {
+    const [x, y, z, w] = q;
+    const xx = x * x, yy = y * y, zz = z * z;
+    const xy = x * y, xz = x * z, yz = y * z;
+    const wx = w * x, wy = w * y, wz = w * z;
+    const m00 = 1 - 2 * (yy + zz), m01 = 2 * (xy - wz), m02 = 2 * (xz + wy);
+    const m10 = 2 * (xy + wz), m11 = 1 - 2 * (xx + zz), m12 = 2 * (yz - wx);
+    const m20 = 2 * (xz - wy), m21 = 2 * (yz + wx), m22 = 1 - 2 * (xx + yy);
+    return new Float32Array([
+      m00 * s[0], m10 * s[0], m20 * s[0], 0,
+      m01 * s[1], m11 * s[1], m21 * s[1], 0,
+      m02 * s[2], m12 * s[2], m22 * s[2], 0,
+      t[0], t[1], t[2], 1,
+    ]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2);
+    const nf = 1 / (near - far);
+    return new Float32Array([
+      f / aspect, 0, 0, 0,
+      0, f, 0, 0,
+      0, 0, (far + near) * nf, -1,
+      0, 0, 2 * far * near * nf, 0,
+    ]);
+  },
+  lookAt(eye, center, up) {
+    let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+    let len = Math.hypot(zx, zy, zz) || 1;
+    zx /= len; zy /= len; zz /= len;
+    let xx = up[1] * zz - up[2] * zy;
+    let xy = up[2] * zx - up[0] * zz;
+    let xz = up[0] * zy - up[1] * zx;
+    len = Math.hypot(xx, xy, xz) || 1;
+    xx /= len; xy /= len; xz /= len;
+    const yx = zy * xz - zz * xy;
+    const yy = zz * xx - zx * xz;
+    const yz = zx * xy - zy * xx;
+    return new Float32Array([
+      xx, yx, zx, 0,
+      xy, yy, zy, 0,
+      xz, yz, zz, 0,
+      -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+      -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+      -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+      1,
+    ]);
+  },
+  /* 法线矩阵 = 世界矩阵左上 3x3 的逆转置。非均匀缩放时这是唯一正确的做法。 */
+  normalMatrix(m) {
+    const a = m[0], b = m[1], c = m[2];
+    const d = m[4], e = m[5], f = m[6];
+    const g = m[8], h = m[9], i = m[10];
+    const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+    const det = a * A + b * B + c * C;
+    if (Math.abs(det) < 1e-12) {
+      return new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    }
+    const inv = 1 / det;
+    // inverse(M)^T，列主序展开
+    return new Float32Array([
+      A * inv, B * inv, C * inv,
+      -(b * i - c * h) * inv, (a * i - c * g) * inv, -(a * h - b * g) * inv,
+      (b * f - c * e) * inv, -(a * f - c * d) * inv, (a * e - b * d) * inv,
+    ]);
+  },
+};
+
+/* ---------------- 场景准备 ---------------- */
+const nodes = Array.isArray(AIR.nodes) ? AIR.nodes : [];
+const meshes = Array.isArray(AIR.meshes) ? AIR.meshes : [];
+const materials = Array.isArray(AIR.materials) ? AIR.materials : [];
+const textures = Array.isArray(AIR.textures) ? AIR.textures : [];
+
+/* 节点世界矩阵：父链递归，顺带记录环路（坏资产不该让预览卡死）。 */
+const worldCache = new Map();
+function worldOf(index, depth) {
+  if (worldCache.has(index)) return worldCache.get(index);
+  const node = nodes[index];
+  if (!node || depth > 64) return M4.identity();
+  const local = M4.trs(node.position || [0, 0, 0], node.rotation || [0, 0, 0, 1], node.scale || [1, 1, 1]);
+  const parent = (typeof node.parent === "number") ? node.parent : null;
+  const world = parent === null ? local : M4.mul(worldOf(parent, depth + 1), local);
+  worldCache.set(index, world);
+  return world;
+}
+
+/* 顶点数据包成可直接上传的 typed array。 */
+const draws = [];
+const bounds = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+function expandBounds(p, world) {
+  const x = p[0], y = p[1], z = p[2];
+  const wx = world[0] * x + world[4] * y + world[8] * z + world[12];
+  const wy = world[1] * x + world[5] * y + world[9] * z + world[13];
+  const wz = world[2] * x + world[6] * y + world[10] * z + world[14];
+  if (wx < bounds.min[0]) bounds.min[0] = wx;
+  if (wy < bounds.min[1]) bounds.min[1] = wy;
+  if (wz < bounds.min[2]) bounds.min[2] = wz;
+  if (wx > bounds.max[0]) bounds.max[0] = wx;
+  if (wy > bounds.max[1]) bounds.max[1] = wy;
+  if (wz > bounds.max[2]) bounds.max[2] = wz;
+}
+
+for (let n = 0; n < nodes.length; n++) {
+  const node = nodes[n];
+  if (typeof node.mesh !== "number") continue;
+  const mesh = meshes[node.mesh];
+  if (!mesh || !mesh.positions || mesh.positions.length === 0) continue;
+  draws.push({ node, mesh, meshIndex: node.mesh, world: worldOf(n, 0) });
+  const aabbMin = mesh.aabb_min || [0, 0, 0];
+  const aabbMax = mesh.aabb_max || [0, 0, 0];
+  for (let c = 0; c < 8; c++) {
+    expandBounds([
+      (c & 1) ? aabbMax[0] : aabbMin[0],
+      (c & 2) ? aabbMax[1] : aabbMin[1],
+      (c & 4) ? aabbMax[2] : aabbMin[2],
+    ], worldOf(n, 0));
+  }
+}
+
+/* ---------------- HUD ---------------- */
+(function fillHud() {
+  const stats = AIR.stats || {};
+  const meta = document.getElementById("meta");
+  const source = AIR.source || {};
+  const units = AIR.units || {};
+  const parts = [];
+  if (source.container) parts.push(source.container.toUpperCase());
+  if (source.path) parts.push(String(source.path).split(/[\\/]/).pop());
+  if (units.meters_per_unit) parts.push("1 unit = " + units.meters_per_unit + " m");
+  if (units.up_axis) parts.push("up " + units.up_axis);
+  meta.textContent = parts.join(" · ") || "AIR v" + (AIR.air_version || "?");
+  if (SHARD_META && Array.isArray(SHARD_META.files)) {
+    meta.title = "数据分片：" + SHARD_META.files.join("、");
+  }
+
+  const rows = [
+    ["节点", stats.node_count ?? nodes.length],
+    ["网格", stats.mesh_count ?? meshes.length],
+    ["顶点", fmt(stats.vertex_count ?? 0)],
+    ["三角形", fmt(stats.triangle_count ?? 0)],
+    ["材质", stats.material_count ?? materials.length],
+    ["贴图", stats.texture_count ?? textures.length],
+    // 这两行是「资产里有什么」，不是「页面渲染了什么」：预览不播放动画、
+    // 不做蒙皮变形，标签必须写清楚，免得被当成渲染能力。
+    ["骨骼 / 关节（仅统计）", (stats.skin_count ?? 0) + " / " + (stats.joint_count ?? 0)],
+    ["动画轨道（未载入）", stats.animation_count ?? 0],
+    ["几何占用", bytes(stats.geometry_bytes ?? 0)],
+    ["数据分片", (SHARD_META && SHARD_META.total ? SHARD_META.total + " 个" : "—")],
+  ];
+  const table = document.getElementById("stats");
+  table.innerHTML = rows
+    .map(([k, v]) => '<tr><td class="k">' + k + '</td><td class="v">' + v + "</td></tr>")
+    .join("");
+
+  const issues = Array.isArray(AIR.issues) ? AIR.issues.slice() : [];
+  if (issues.length) {
+    document.getElementById("notes").classList.remove("hidden");
+    document.getElementById("issues").innerHTML = issues
+      .map((text) => "<li>" + escapeHtml(text) + "</li>")
+      .join("");
+  }
+})();
+
+function fmt(n) { return Number(n).toLocaleString("en-US"); }
+function bytes(n) {
+  if (!n) return "0";
+  const units = ["B", "KB", "MB", "GB"];
+  let index = 0, value = Number(n);
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
+  return value.toFixed(value >= 100 || index === 0 ? 0 : 1) + " " + units[index];
+}
+function escapeHtml(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/* ---------------- WebGL ---------------- */
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl", { antialias: true, alpha: false })
+  || canvas.getContext("experimental-webgl", { antialias: true, alpha: false });
+if (!gl) {
+  document.getElementById("fallback").style.display = "flex";
+  throw new Error("WebGL unavailable");
+}
+
+const VS = [
+  "attribute vec3 aPos;",
+  "attribute vec3 aNormal;",
+  "attribute vec2 aUv;",
+  "uniform mat4 uViewProj;",
+  "uniform mat4 uWorld;",
+  "uniform mat3 uNormalMat;",
+  "varying vec3 vNormal;",
+  "varying vec3 vWorld;",
+  "varying vec2 vUv;",
+  "void main() {",
+  "  vec4 wp = uWorld * vec4(aPos, 1.0);",
+  "  vWorld = wp.xyz;",
+  "  vNormal = normalize(uNormalMat * aNormal);",
+  "  vUv = aUv;",
+  "  gl_Position = uViewProj * wp;",
+  "}",
+].join("\n");
+
+const FS = [
+  "precision mediump float;",
+  "varying vec3 vNormal;",
+  "varying vec3 vWorld;",
+  "varying vec2 vUv;",
+  "uniform vec4 uBaseColor;",
+  "uniform float uRoughness;",
+  "uniform float uMetallic;",
+  "uniform float uHasTex;",
+  "uniform sampler2D uTex;",
+  "uniform vec3 uEye;",
+  "void main() {",
+  "  vec3 base = uBaseColor.rgb;",
+  "  if (uHasTex > 0.5) {",
+  "    vec3 texel = texture2D(uTex, vUv).rgb;",
+  "    base *= pow(texel, vec3(2.2));",
+  "  }",
+  "  vec3 n = normalize(vNormal);",
+  "  vec3 v = normalize(uEye - vWorld);",
+  "  if (dot(n, v) < 0.0) n = -n;",
+  "  vec3 key = normalize(vec3(0.45, 0.80, 0.55));",
+  "  vec3 fill = normalize(vec3(-0.55, 0.25, -0.65));",
+  "  float keyD = max(dot(n, key), 0.0);",
+  "  float fillD = max(dot(n, fill), 0.0);",
+  "  vec3 halfV = normalize(key + v);",
+  "  float spec = pow(max(dot(n, halfV), 0.0), mix(96.0, 10.0, uRoughness));",
+  "  vec3 ambient = mix(vec3(0.10, 0.11, 0.14), vec3(0.26, 0.30, 0.36), n.y * 0.5 + 0.5);",
+  "  vec3 tint = mix(vec3(1.0), base, uMetallic);",
+  "  vec3 color = base * (ambient + keyD * 0.95 + fillD * 0.28) + spec * tint * 0.55;",
+  "  gl_FragColor = vec4(pow(color, vec3(1.0 / 2.2)), uBaseColor.a);",
+  "}",
+].join("\n");
+
+function compile(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error("shader: " + gl.getShaderInfoLog(shader));
+  }
+  return shader;
+}
+
+const program = gl.createProgram();
+gl.attachShader(program, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  throw new Error("link: " + gl.getProgramInfoLog(program));
+}
+gl.useProgram(program);
+
+const loc = {
+  aPos: gl.getAttribLocation(program, "aPos"),
+  aNormal: gl.getAttribLocation(program, "aNormal"),
+  aUv: gl.getAttribLocation(program, "aUv"),
+  viewProj: gl.getUniformLocation(program, "uViewProj"),
+  world: gl.getUniformLocation(program, "uWorld"),
+  normalMat: gl.getUniformLocation(program, "uNormalMat"),
+  baseColor: gl.getUniformLocation(program, "uBaseColor"),
+  roughness: gl.getUniformLocation(program, "uRoughness"),
+  metallic: gl.getUniformLocation(program, "uMetallic"),
+  hasTex: gl.getUniformLocation(program, "uHasTex"),
+  tex: gl.getUniformLocation(program, "uTex"),
+  eye: gl.getUniformLocation(program, "uEye"),
+};
+
+const uintIndex = !!gl.getExtension("OES_element_index_uint");
+const notes = [];
+
+/* 运行期发现的问题（缺索引扩展、贴图解码失败…）即时挂到右上角面板。 */
+function addNote(text) {
+  notes.push(text);
+  const panel = document.getElementById("notes");
+  if (panel) panel.classList.remove("hidden");
+  const list = document.getElementById("issues");
+  if (list) {
+    const item = document.createElement("li");
+    item.textContent = String(text);
+    list.appendChild(item);
+  }
+}
+
+/* 每个 mesh 一份 GPU 资源：顶点三件套 + 索引。 */
+const meshes_gl = meshes.map((mesh, index) => {
+  const count = (mesh.positions || []).length;
+  if (!count) return null;
+  const positions = new Float32Array(count * 3);
+  (mesh.positions || []).forEach((p, i) => {
+    positions[i * 3] = p[0]; positions[i * 3 + 1] = p[1]; positions[i * 3 + 2] = p[2];
+  });
+  const normalSrc = (mesh.normals && mesh.normals.length === count) ? mesh.normals : null;
+  const normals = new Float32Array(count * 3);
+  if (normalSrc) {
+    normalSrc.forEach((p, i) => {
+      normals[i * 3] = p[0]; normals[i * 3 + 1] = p[1]; normals[i * 3 + 2] = p[2];
+    });
+  }
+  const uvSrc = (mesh.uvs && mesh.uvs.length === count) ? mesh.uvs : null;
+  const uvs = new Float32Array(count * 2);
+  if (uvSrc) uvSrc.forEach((p, i) => { uvs[i * 2] = p[0]; uvs[i * 2 + 1] = p[1]; });
+
+  const rawIndices = mesh.indices || [];
+  let indices = null;
+  let indexType = gl.UNSIGNED_INT;
+  if (rawIndices.length) {
+    if (uintIndex || count <= 65535) {
+      indexType = uintIndex ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+      indices = uintIndex ? new Uint32Array(rawIndices) : new Uint16Array(rawIndices);
+    } else {
+      notes.push("网格 " + (mesh.name || "#" + index) + " 顶点数超 65535 且缺少 32 位索引扩展，未显示");
+    }
+  }
+
+  const vbo = { pos: gl.createBuffer(), nrm: gl.createBuffer(), uv: gl.createBuffer() };
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo.pos);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo.nrm);
+  gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo.uv);
+  gl.bufferData(gl.ARRAY_BUFFER, uvs, gl.STATIC_DRAW);
+  let ibo = null;
+  if (indices) {
+    ibo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+  }
+  return { vbo, ibo, indexType, count, indexCount: indices ? indices.length : 0 };
+});
+
+if (notes.length) {
+  document.getElementById("notes").classList.remove("hidden");
+  const list = document.getElementById("issues");
+  list.innerHTML += notes.map((text) => "<li>" + escapeHtml(text) + "</li>").join("");
+}
+
+/* 贴图：只认内嵌（base64）的那些，外部贴图在导出时已经标注。 */
+const texMap = new Map();
+
+/* mime_type 可能缺失或写错（FBX/GLB 里常见），按 base64 头部魔数兜底，
+   否则 data: 前缀一错，浏览器直接拒绝解码，贴图就成了纯色。 */
+function sniffMime(base64, declared) {
+  const head = String(base64 || "").slice(0, 16);
+  if (head.startsWith("iVBORw0KGgo")) return "image/png";
+  if (head.startsWith("/9j/")) return "image/jpeg";
+  if (head.startsWith("R0lGOD")) return "image/gif";
+  if (head.startsWith("UklGR")) return "image/webp";
+  const clean = String(declared || "").trim().toLowerCase();
+  if (/^image\/[a-z0-9.+-]+$/.test(clean)) return clean;
+  return "image/png";
+}
+
+textures.forEach((texture, index) => {
+  if (!texture || !texture.data_base64) return;
+  const image = new Image();
+  const label = texture.name || ("#" + index);
+  const state = { ready: false, handle: gl.createTexture() };
+  image.onload = () => {
+    gl.bindTexture(gl.TEXTURE_2D, state.handle);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    const pow2 = (image.width & (image.width - 1)) === 0 && (image.height & (image.height - 1)) === 0;
+    if (pow2) {
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    } else {
+      // WebGL1 不允许非 2 次幂贴图带 mipmap：退化成线性过滤，别让它变成黑块。
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    }
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    state.ready = true;
+  };
+  image.onerror = () => {
+    state.ready = false;
+    addNote("贴图 " + label + " 解码失败（mime " + sniffMime(texture.data_base64, texture.mime_type) + "），已退回材质底色");
+  };
+  image.src = "data:" + sniffMime(texture.data_base64, texture.mime_type) + ";base64," + texture.data_base64;
+  texMap.set(index, state);
+});
+
+/* 场景为空时给一个保底尺寸，免得相机除零。 */
+if (!isFinite(bounds.min[0])) {
+  bounds.min = [-0.5, -0.5, -0.5];
+  bounds.max = [0.5, 0.5, 0.5];
+}
+const center = [
+  (bounds.min[0] + bounds.max[0]) / 2,
+  (bounds.min[1] + bounds.max[1]) / 2,
+  (bounds.min[2] + bounds.max[2]) / 2,
+];
+const radius = Math.max(
+  1e-4,
+  Math.hypot(
+    bounds.max[0] - bounds.min[0],
+    bounds.max[1] - bounds.min[1],
+    bounds.max[2] - bounds.min[2]
+  ) / 2
+);
+
+/* ---------------- 相机 ---------------- */
+const camera = {
+  yaw: 0.7,
+  pitch: 0.42,
+  distance: radius * 2.6,
+  target: center.slice(),
+};
+function resetCamera() {
+  camera.yaw = 0.7;
+  camera.pitch = 0.42;
+  camera.distance = radius * 2.6;
+  camera.target = center.slice();
+}
+resetCamera();
+
+function eyePosition() {
+  const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
+  const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
+  return [
+    camera.target[0] + camera.distance * cp * sy,
+    camera.target[1] + camera.distance * sp,
+    camera.target[2] + camera.distance * cp * cy,
+  ];
+}
+
+let dragging = null;
+canvas.addEventListener("mousedown", (event) => {
+  dragging = { x: event.clientX, y: event.clientY, button: event.button };
+  canvas.classList.add("dragging");
+});
+window.addEventListener("mouseup", () => { dragging = null; canvas.classList.remove("dragging"); });
+window.addEventListener("mousemove", (event) => {
+  if (!dragging) return;
+  const dx = event.clientX - dragging.x;
+  const dy = event.clientY - dragging.y;
+  dragging.x = event.clientX;
+  dragging.y = event.clientY;
+  if (dragging.button === 0) {
+    camera.yaw -= dx * 0.008;
+    camera.pitch = Math.max(-1.53, Math.min(1.53, camera.pitch + dy * 0.008));
+  } else {
+    // 平移量与距离成正比：近看时挪得细，远看时挪得快。
+    const eye = eyePosition();
+    let fx = camera.target[0] - eye[0];
+    let fy = camera.target[1] - eye[1];
+    let fz = camera.target[2] - eye[2];
+    const fl = Math.hypot(fx, fy, fz) || 1;
+    fx /= fl; fy /= fl; fz /= fl;
+    let rx = fy * 0 - fz * 1, ry = fz * 0 - fx * 0, rz = fx * 1 - fy * 0;
+    const rl = Math.hypot(rx, ry, rz) || 1;
+    rx /= rl; ry /= rl; rz /= rl;
+    const ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+    const scale = camera.distance * 0.0016;
+    camera.target[0] -= (rx * dx - ux * dy) * scale;
+    camera.target[1] -= (ry * dx - uy * dy) * scale;
+    camera.target[2] -= (rz * dx - uz * dy) * scale;
+  }
+});
+canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+canvas.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  const factor = Math.exp(event.deltaY * 0.0012);
+  camera.distance = Math.max(radius * 0.05, Math.min(radius * 200, camera.distance * factor));
+}, { passive: false });
+window.addEventListener("keydown", (event) => {
+  if (event.key === "r" || event.key === "R") resetCamera();
+});
+
+/* ---------------- 尺寸 ---------------- */
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.floor(canvas.clientWidth * dpr);
+  const height = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  return { width, height };
+}
+
+/* ---------------- 绘制 ---------------- */
+gl.enable(gl.DEPTH_TEST);
+gl.depthFunc(gl.LEQUAL);
+gl.clearColor(0.063, 0.071, 0.086, 1);
+
+function bindMesh(gpu) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, gpu.vbo.pos);
+  gl.enableVertexAttribArray(loc.aPos);
+  gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gpu.vbo.nrm);
+  gl.enableVertexAttribArray(loc.aNormal);
+  gl.vertexAttribPointer(loc.aNormal, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gpu.vbo.uv);
+  gl.enableVertexAttribArray(loc.aUv);
+  gl.vertexAttribPointer(loc.aUv, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gpu.ibo);
+}
+
+function draw() {
+  const { width, height } = resize();
+  gl.viewport(0, 0, width, height);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const eye = eyePosition();
+  const view = M4.lookAt(eye, camera.target, [0, 1, 0]);
+  const proj = M4.perspective(
+    Math.PI / 4,
+    Math.max(1e-4, width / Math.max(1, height)),
+    Math.max(1e-4, camera.distance * 0.01),
+    camera.distance * 12 + radius * 8
+  );
+  gl.uniformMatrix4fv(loc.viewProj, false, M4.mul(proj, view));
+  gl.uniform3fv(loc.eye, eye);
+  gl.uniform1i(loc.tex, 0);
+  gl.activeTexture(gl.TEXTURE0);
+
+  for (const item of draws) {
+    const gpu = meshes_gl[item.meshIndex];
+    if (!gpu) continue;
+    bindMesh(gpu);
+    gl.uniformMatrix4fv(loc.world, false, item.world);
+    gl.uniformMatrix3fv(loc.normalMat, false, M4.normalMatrix(item.world));
+
+    const parts = (item.mesh.material_parts && item.mesh.material_parts.length)
+      ? item.mesh.material_parts
+      : [{
+        material: null,
+        material_name: "",
+        triangle_offset: 0,
+        triangle_count: Math.floor(gpu.indexCount / 3),
+      }];
+
+    for (const part of parts) {
+      if (!part.triangle_count) continue;
+      const material = (typeof part.material === "number") ? materials[part.material] : null;
+      const color = (material && material.base_color && material.base_color.length === 4)
+        ? material.base_color
+        : [0.72, 0.74, 0.78, 1];
+      gl.uniform4fv(loc.baseColor, color);
+      gl.uniform1f(loc.roughness, (material && isFinite(material.roughness)) ? material.roughness : 0.55);
+      gl.uniform1f(loc.metallic, (material && isFinite(material.metallic)) ? material.metallic : 0.0);
+
+      let hasTex = 0;
+      const textureIndex = material && (typeof material.base_color_texture === "number")
+        ? material.base_color_texture
+        : -1;
+      const texState = textureIndex >= 0 ? texMap.get(textureIndex) : null;
+      if (texState && texState.ready) {
+        gl.bindTexture(gl.TEXTURE_2D, texState.handle);
+        hasTex = 1;
+      }
+      gl.uniform1f(loc.hasTex, hasTex);
+
+      if (material && material.double_sided) gl.disable(gl.CULL_FACE);
+      else { gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK); }
+
+      const bytesPerIndex = gpu.indexType === gl.UNSIGNED_INT ? 4 : 2;
+      if (gpu.ibo) {
+        gl.drawElements(
+          gl.TRIANGLES,
+          part.triangle_count * 3,
+          gpu.indexType,
+          part.triangle_offset * 3 * bytesPerIndex
+        );
+      } else {
+        // 无索引的网格：按顶点顺序当三角形列表画，手动算起点。
+        gl.drawArrays(
+          gl.TRIANGLES,
+          part.triangle_offset * 3,
+          part.triangle_count * 3
+        );
+      }
+    }
+  }
+  requestAnimationFrame(draw);
+}
+
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

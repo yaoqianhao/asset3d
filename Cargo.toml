@@ -1,0 +1,26 @@
+[package]
+name = "asset3d"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.79"
+description = "ai-ide 插件：读取 FBX/GLB 3D 资产，解析并归一化为引擎内核 AIR 数据，支持导出与可视化预览"
+
+# 独立于 ai-ide 主 workspace 构建：插件是被宿主拉起的独立可执行文件，
+# 不参与内核的 workspace 依赖图（否则插件的 ufbx/gltf 会污染内核构建）。
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+# FBX：ufbx 的 Rust 绑定（C 实现，靠 cc 构建；本机 MinGW gcc 可用）
+ufbx = "0.11"
+# glTF / GLB：纯 Rust 解析
+gltf = { version = "1.4", default-features = false, features = ["names", "utils", "extras"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,12 @@
+# 本插件独立构建配置。
+#
+# 背景：`D:\ai_ide\.cargo\config.toml` 用 `replace-with = "ustc"` 指向中科大
+# 镜像，而该镜像的 sparse 索引当前返回 403，导致本插件拉不到 ufbx / gltf。
+# Cargo 的配置按目录逐级合并、子目录只能改值不能删键，所以这里沿用同一个
+# source 名 `ustc` 把地址换成可用的 rsproxy 镜像——只影响本插件目录，不改动
+# 上层仓库配置。若上层镜像恢复，删除本文件即可。
+[source.ustc]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

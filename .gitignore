@@ -1,0 +1,14 @@
+# 构建产物
+target/
+
+# 联调台工作区与夹具（dev/harness.py 每次运行都会重建）
+.tmp-ws/
+
+# 日志与一次性探针输出
+*.log
+*.err
+*.out
+
+# Python 缓存
+__pycache__/
+*.pyc

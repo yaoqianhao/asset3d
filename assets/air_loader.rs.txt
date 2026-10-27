@@ -1,0 +1,129 @@
+//! AIR 资产加载器（由 ai_ide 的 asset3d 插件 `export_engine_loader` 生成，请勿手改）
+//!
+//! 生成源：__GENERATED_FROM__
+//! 生成时间：__GENERATED_AT__
+//! 数据版本：AIR v__AIR_VERSION__ / AIRB 容器 v__AIRB_VERSION__
+//!
+//! # 口径：只做薄包装，不复刻字段定义
+//!
+//! AIR 字段与校验规则的唯一实现是 `r3e_asset::air_import`：空文件、magic 不符、
+//! 版本不符、头被截断、blob 长度不一致、span 越界、索引越界、必填字段缺失，
+//! 全部在那里明确报错，绝不静默填默认值。插件侧的 `src/air.rs` / `src/air_bin.rs`
+//! 是同一份契约的**写端**。
+//!
+//! 因此本文件**不再生成第二套结构体**。旧版模板把 AIR 的字段在引擎里又抄了一遍，
+//! 两份定义各自演进，引擎读到的字段和插件写出的字段迟早对不上；现在字段只有一份，
+//! 这里只保留引擎最常用的几个薄包装。
+//!
+//! # 用法
+//!
+//! ```ignore
+//! // 直接入库（与 .fbx / .glb / .gltf 的 AssetLibrary::load 并存，互不影响）
+//! let mut lib = r3e_asset::AssetLibrary::new();
+//! let id = air_loader::register(&mut lib, "assets/cube.air.bin")?;
+//!
+//! let entry = air_loader::load_entry("assets/cube.air.json")?; // 只要 AssetEntry
+//! let doc = air_loader::load_doc("assets/cube.air.bin")?;      // 要 AIR 原始字段
+//! ```
+
+use std::path::Path;
+
+use r3e_asset::air_import::{self, AirDoc, AirLoadError};
+use r3e_asset::{AssetEntry, AssetError, AssetId, AssetLibrary};
+
+/// AIR JSON 数据版本（转引自引擎实现，不要在别处另立常量）。
+pub const AIR_VERSION: u32 = air_import::AIR_VERSION;
+/// AIRB 二进制容器版本（转引自引擎实现）。
+pub const AIRB_VERSION: u32 = air_import::AIRB_VERSION;
+/// AIRB 文件头长度：magic(4) + version(4) + blob_len(8) + meta_len(4)。
+pub const AIRB_HEADER_LEN: usize = air_import::AIRB_HEADER_LEN;
+/// 插件默认导出的两种落盘后缀。
+///
+/// 注意 `.air.json` / `.air.bin` 的真实扩展名是 `json` / `bin`，**不能**靠扩展名
+/// 分派（会和普通 JSON 撞车），所以这里一律按内容嗅探：`AIRB` magic 走二进制，
+/// 首个非空字符是 `{` 走 JSON。
+pub const AIR_SUFFIXES: [&str; 2] = [".air.json", ".air.bin"];
+
+/// 按内容解析一份 AIR 文件为引擎资产条目（渲染与物理链直接消费）。
+pub fn load_entry(path: impl AsRef<Path>) -> Result<AssetEntry, AssetError> {
+    air_import::load_air_file(path.as_ref())
+}
+
+/// 解析内存里的 AIR 字节；`base_dir` 用于解析外部（非内嵌）贴图的相对路径。
+pub fn load_entry_from_bytes(
+    bytes: &[u8],
+    id: AssetId,
+    source_path: &str,
+    base_dir: Option<&Path>,
+) -> Result<AssetEntry, AssetError> {
+    air_import::load_air_bytes(bytes, id, source_path, base_dir)
+        .map_err(|err: AirLoadError| err.into_asset_error(Path::new(source_path)))
+}
+
+/// 只解析不转换：需要读 AIR 原始字段（回读校验、导出对比、工具链体检）时用。
+pub fn load_doc(path: impl AsRef<Path>) -> Result<AirDoc, AssetError> {
+    let path = path.as_ref();
+    let display = path.display().to_string();
+    let bytes = std::fs::read(path).map_err(|err| AssetError::Load {
+        path: display.clone(),
+        message: format!("读取失败：{err}"),
+    })?;
+    air_import::parse_bytes(&bytes).map_err(|err| err.into_asset_error(path))
+}
+
+/// 入库并返回 `AssetId`。
+///
+/// 走 `AssetLibrary::load_air`（新增入口）；`.fbx` / `.glb` / `.gltf` 仍走
+/// `AssetLibrary::load`，两条路径互不影响。
+pub fn register(library: &mut AssetLibrary, path: impl AsRef<Path>) -> Result<AssetId, AssetError> {
+    library.load_air(path)
+}
+
+/// 校验摘要：CI 里批量体检导出结果，不想为「能不能读」拉起整套资产库时用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirSummary {
+    /// `air` 版本号（来自文件头）。
+    pub air_version: u32,
+    /// 容器标签：`air`（JSON）或 `airb`（二进制）。
+    pub container: String,
+    pub nodes: usize,
+    pub meshes: usize,
+    pub triangles: usize,
+    pub materials: usize,
+    pub textures: usize,
+    pub skins: usize,
+    pub animations: usize,
+    /// 导入期插件记录的问题（不阻断读取，仅供展示）。
+    pub issues: Vec<String>,
+}
+
+/// 只校验并汇总，不产出资产。
+pub fn verify(path: impl AsRef<Path>) -> Result<AirSummary, AssetError> {
+    let doc = load_doc(path)?;
+    Ok(AirSummary {
+        air_version: doc.air_version,
+        container: doc.source.container.clone(),
+        nodes: doc.nodes.len(),
+        meshes: doc.meshes.len(),
+        triangles: doc.meshes.iter().map(|m| m.indices.len() / 3).sum(),
+        materials: doc.materials.len(),
+        textures: doc.textures.len(),
+        skins: doc.skins.len(),
+        animations: doc.animations.len(),
+        issues: doc.issues.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 这份占位测试随模板一起生成，用来确认「生成的加载器至少能编译、常量口径一致」。
+    #[test]
+    fn versions_match_engine_implementation() {
+        assert_eq!(AIR_VERSION, air_import::AIR_VERSION);
+        assert_eq!(AIRB_VERSION, air_import::AIRB_VERSION);
+        assert_eq!(AIRB_HEADER_LEN, 20);
+        assert_eq!(AIR_SUFFIXES, [".air.json", ".air.bin"]);
+    }
+}
