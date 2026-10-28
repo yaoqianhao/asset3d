@@ -77,6 +77,11 @@ pub const LEGACY_READ_BYTES: u64 = ((FRAME_LIMIT_BYTES - FRAME_RESERVE_BYTES) as
 /// base64 后约 683 KB，加路径与字段名仍远低于「1 MiB 减 64 KiB 预留」，
 /// 所以读分片的上限是宿主那 512 KiB，而不是帧预算。
 pub const READ_WINDOW_BYTES: usize = HOST_READ_WINDOW_BYTES as usize;
+/// `--standalone` 模式下「路径不对」的错误码。
+///
+/// 5xxx 是插件自有的错误域（5001 = 导入失败、5002 = 参数语义错），与宿主
+/// 6xxx 的闸门码分开，用户看到码就知道该找插件还是找 IDE。
+pub const STANDALONE_BAD_PATH: i64 = 5003;
 
 /// 读/写 `bytes` 字节需要多少次宿主调用（按分片长度向上取整）。
 pub fn calls_for(bytes: u64) -> usize {
@@ -220,6 +225,11 @@ pub struct Host {
     io_mode: AtomicU8,
     /// 本次工具调用已经用掉的宿主调用次数（宿主按工具调用重置配额）。
     calls_used: AtomicU64,
+    /// `--standalone` 调试模式的本地直读根目录（见 [`Host::new_local`]）。
+    ///
+    /// 有值时 `host/fs.*` 的**读**路径走 `std::fs`，不再等一个并不存在的宿主
+    /// 回包；写路径一律拒绝——调试入口不该能改盘。
+    local_root: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// 宿主分片读写能力：探一次就缓存，避免每个大文件都先撞一遍错误。
@@ -246,7 +256,85 @@ impl Host {
             plugin_id: Mutex::new(String::new()),
             io_mode: AtomicU8::new(0),
             calls_used: AtomicU64::new(0),
+            local_root: Mutex::new(None),
         }
+    }
+
+    /// 造一个**不接宿主**的读盘客户端：`--standalone` 用。
+    ///
+    /// 只有在 IDE 之外单独跑 `asset3d --standalone <workspace>` 时才走这里。
+    /// 三件事必须同时成立，否则宁可报错也不要「看起来能跑」：
+    /// 1. 根目录必须是已有目录（传文件进来就说明调用方搞错了参数）；
+    /// 2. 读到的路径必须是根目录下的相对路径，`..` 与盘符一律拒绝；
+    /// 3. 写操作全部拒绝（[`Host::write_bytes`] 在这里直接回错误）。
+    pub fn new_local(root: &str) -> Result<Self, HostError> {
+        let canonical = std::path::Path::new(root)
+            .canonicalize()
+            .map_err(|err| HostError {
+                code: STANDALONE_BAD_PATH,
+                message: format!("工作区 `{root}` 打不开：{err}"),
+            })?;
+        if !canonical.is_dir() {
+            return Err(HostError {
+                code: STANDALONE_BAD_PATH,
+                message: format!("`{root}` 不是目录：--standalone 需要的是工作区根目录"),
+            });
+        }
+        let host = Self::new();
+        host.set_workspace(&canonical.to_string_lossy(), "");
+        *host
+            .local_root
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(canonical);
+        Ok(host)
+    }
+
+    /// 本地直读模式是否开启。
+    fn local_enabled(&self) -> bool {
+        self.local_root
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+    }
+
+    /// 本地模式拒绝写盘与其他宿主方法。
+    fn reject_in_local_mode(&self, what: &str) -> Result<(), HostError> {
+        if self.local_enabled() {
+            return Err(HostError {
+                code: STANDALONE_BAD_PATH,
+                message: format!(
+                    "--standalone 是只读调试模式，`{what}` 不可用：要看导出效果请回 IDE 里跑同一条命令（会走审批）。"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// 把相对路径落到本地绝对路径；非本地模式或路径越界都返回 `None`。
+    fn local_path(&self, relative: &str) -> Option<std::path::PathBuf> {
+        let guard = self
+            .local_root
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = guard.as_ref()?;
+        let trimmed = relative.trim();
+        // 空路径 = 工作区根目录本身：`host/fs.list("")` 就是这么用的。
+        if trimmed.is_empty() {
+            return Some(root.clone());
+        }
+        let candidate = std::path::Path::new(trimmed);
+        if candidate.is_absolute() {
+            return None;
+        }
+        for part in candidate.components() {
+            match part {
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                // `..` / 盘符 / 根：一律不认。宿主闸门本来就会挡，这里只是本地
+                // 模式的等价约束，别让调试入口成为唯一的漏网口。
+                _ => return None,
+            }
+        }
+        Some(root.join(candidate))
     }
 
     /// 每次工具调用开始时归零，与宿主 `begin_call` 对齐。
@@ -385,6 +473,20 @@ impl Host {
     /// `bytes` / `eof` / `size` 推进——坑就在这儿：宿主会把 `maxBytes` 夹到 512 KiB，
     /// 凭「我要了多大」推偏移会漏字节。
     pub fn read_bytes(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        if let Some(local) = self.local_path(path) {
+            let meta = std::fs::metadata(&local).map_err(|err| HostError {
+                code: STANDALONE_BAD_PATH,
+                message: format!("读不到 `{path}`：{err}"),
+            })?;
+            let size = meta.len();
+            if size > MAX_ASSET_BYTES {
+                return Err(Self::too_large(path, size));
+            }
+            return std::fs::read(&local).map_err(|err| HostError {
+                code: STANDALONE_BAD_PATH,
+                message: format!("读不到 `{path}`：{err}"),
+            });
+        }
         let size = self.file_size(path)?;
         if size == 0 {
             return Ok(Vec::new());
@@ -543,6 +645,13 @@ impl Host {
     }
 
     pub fn file_size(&self, path: &str) -> Result<u64, HostError> {
+        if let Some(local) = self.local_path(path) {
+            let meta = std::fs::metadata(&local).map_err(|err| HostError {
+                code: STANDALONE_BAD_PATH,
+                message: format!("读不到 `{path}`：{err}"),
+            })?;
+            return Ok(meta.len());
+        }
         let reply = self.call("host/fs.stat", json!({ "path": path }))?;
         reply
             .get("size")
@@ -552,6 +661,30 @@ impl Host {
 
     /// 列一层目录：返回 `(相对路径, 是否目录, 字节数)`。
     pub fn list(&self, path: &str) -> Result<Vec<(String, bool, u64)>, HostError> {
+        if let Some(local) = self.local_path(path) {
+            let mut out = Vec::new();
+            let entries = std::fs::read_dir(&local).map_err(|err| HostError {
+                code: STANDALONE_BAD_PATH,
+                message: format!("列不出 `{path}`：{err}"),
+            })?;
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let meta = match entry.metadata() {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                let joined = if path.is_empty() {
+                    name
+                } else {
+                    format!("{path}/{name}")
+                };
+                out.push((joined, meta.is_dir(), meta.len()));
+            }
+            // 与宿主同序：目录在前、同类按名字排。面板与 `list_assets` 的显示
+            // 顺序都依赖这一点，本地模式不做的话调试画面和真实画面会不一样。
+            out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            return Ok(out);
+        }
         let reply = self.call("host/fs.list", json!({ "path": path }))?;
         let entries = reply
             .get("entries")
@@ -576,6 +709,7 @@ impl Host {
     }
 
     pub fn write_text(&self, path: &str, text: &str) -> Result<Value, HostError> {
+        self.reject_in_local_mode("host/fs.write")?;
         if ensure_frame_budget(path, text.len(), "utf8").is_ok() {
             return self.call(
                 "host/fs.write",
@@ -587,6 +721,7 @@ impl Host {
     }
 
     pub fn write_bytes(&self, path: &str, bytes: &[u8]) -> Result<Value, HostError> {
+        self.reject_in_local_mode("host/fs.write")?;
         // base64 后才是真正进帧的长度，按 4 倍向上取整再算。
         let encoded_len = (bytes.len() + 2) / 3 * 4;
         if ensure_frame_budget(path, encoded_len, "base64").is_ok() {
@@ -732,6 +867,11 @@ impl Host {
 
     /// 进度上报（`host/progress`）。失败不影响主流程：进度是锦上添花。
     pub fn progress(&self, message: &str) {
+        // 本地模式没有宿主可报，打到 stderr：`--standalone` 下看进度就靠它。
+        if self.local_enabled() {
+            eprintln!("asset3d[standalone]: {message}");
+            return;
+        }
         let _ = self.call("host/progress", json!({ "message": message }));
     }
 

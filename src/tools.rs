@@ -48,7 +48,14 @@ impl From<HostError> for ToolError {
         if message.contains("工作区") || message.contains("workspace") {
             message.push_str("（插件只能访问当前打开的工作区：请把资产放进项目目录，或先切换工作区）");
         }
-        Self { code: 5002, message }
+        // 5xxx 是插件自有域：`--standalone` 的「路径不对」靠它传出去，
+        // 统一压成 5002 的话调用方就分不清「参数写错」和「文件不在」。
+        let code = if (5000..6000).contains(&err.code) {
+            err.code
+        } else {
+            5002
+        };
+        Self { code, message }
     }
 }
 
@@ -162,6 +169,21 @@ pub fn catalog() -> Value {
             }
         },
         {
+            "name": "view_render",
+            "description": "插件的面板视图入口（aiide.view/1）：把资产折成一棵声明式描述树（概览/材质/贴图/动画/骨骼/导入问题/动作按钮），交给 IDE 面板渲染。只读，不写盘，不解析动画轨道。省略 path 时列出工作区里可打开的资产。",
+            "risk": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "资产路径；省略时返回空态视图（含工作区资产清单）"
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "export_engine_loader",
             "description": "把引擎侧读取 AIR/AIRB 的 Rust 加载器源码写到指定路径（纯 std + serde，可直接放进 r3e-asset 一类的 crate 使用），并附带格式说明。",
             "risk": "write",
@@ -192,6 +214,7 @@ pub fn invoke(host: &Host, tool: &str, args: &Value) -> Result<Value, ToolError>
         "export_asset" => export(host, args)?,
         "preview_asset" => preview(host, args)?,
         "list_assets" => list(host, args)?,
+        "view_render" => view_render(host, args)?,
         "export_engine_loader" => engine_loader(host, args)?,
         other => {
             return Err(ToolError {
@@ -575,6 +598,96 @@ fn list(host: &Host, args: &Value) -> Result<String, ToolError> {
         }
     }
     Ok(out)
+}
+
+/// 最近一次视图渲染的解析结果。
+///
+/// 面板每收到一次刷新事件（`workspace.changed` / 手动刷新）就会调一次
+/// `view.render`，而一次 96 MB 的 FBX 解析要几百毫秒到几秒。缓存键取
+/// `(相对路径, 宿主报的文件字节数)`：资产没换就复用同一份 [`AirDoc`]，
+/// 换了文件字节数自然对不上，立刻重解析。**只缓存一份**——多留几份能把
+/// 内存吃到一个 G，而用户一次只看一个资产。
+static VIEW_CACHE: std::sync::Mutex<Option<(String, u64, crate::air::AirDoc)>> =
+    std::sync::Mutex::new(None);
+
+/// 面板视图入口（`aiide.view/1`，见 docs/24 §4.2）。
+///
+/// 与 `inspect_asset` 的差别是**输出形态**而不是语义：同一个导入流程，
+/// 但这里折成描述树，且固定 `animations=false`（面板只列动画名字与时长，
+/// 解析轨道纯属白烧 CPU）。
+fn view_render(host: &Host, args: &Value) -> Result<String, ToolError> {
+    let raw = string_arg(args, "path").unwrap_or_default();
+    let tree = if raw.trim().is_empty() {
+        let assets = scan_assets_shallow(host, 100);
+        crate::ui::render_empty(&assets, assets.len() >= 100)
+    } else {
+        let rel = host.normalize_path(&raw);
+        if rel.is_empty() {
+            return Err(ToolError::param("path 不能为空"));
+        }
+        let size = host.file_size(&rel).unwrap_or(0);
+        let cached = {
+            let guard = VIEW_CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+            match guard.as_ref() {
+                Some((cached_rel, cached_size, doc)) if cached_rel == &rel && *cached_size == size => {
+                    Some(doc.clone())
+                }
+                _ => None,
+            }
+        };
+        let doc = match cached {
+            Some(doc) => doc,
+            None => {
+                let (_, doc) = load(host, &rel, false, false)?;
+                let mut guard = VIEW_CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+                *guard = Some((rel.clone(), size, doc.clone()));
+                doc
+            }
+        };
+        crate::ui::render_doc(&rel, &doc)
+    };
+
+    // 一定是字符串回包：宿主 `result_text` 对字符串原样透传，前端 `JSON.parse`
+    // 一次就能拿到视图对象。回对象会被再序列化一层，前端要多剥一层壳。
+    serde_json::to_string(&tree).map_err(|err| ToolError::fail(format!("视图序列化失败：{err}")))
+}
+
+/// 浅扫工作区取资产清单，只给空态视图用。
+///
+/// 深度限 3、目录限 40：空态是「打开面板第一眼」的画面，不能为了列全而把
+/// 200 次宿主配额吃光（`list_assets` 才是给完整清单用的）。扫不到就返回空表，
+/// 让面板显示「工作区里没有资产」，而不是报错。
+fn scan_assets_shallow(host: &Host, limit: usize) -> Vec<(String, u64)> {
+    const MAX_DIRS: usize = 40;
+    let mut queue = vec![(String::new(), 0usize)];
+    let mut visited = 0usize;
+    let mut files: Vec<(String, u64)> = Vec::new();
+    while let Some((current, depth)) = queue.pop() {
+        if visited >= MAX_DIRS || files.len() >= limit {
+            break;
+        }
+        visited += 1;
+        let Ok(entries) = host.list(&current) else {
+            continue;
+        };
+        for (path, is_dir, size) in entries {
+            let name = path.rsplit('/').next().unwrap_or(&path);
+            if is_dir {
+                if depth < 2 && !is_noise_dir(name) {
+                    queue.push((path, depth + 1));
+                }
+                continue;
+            }
+            if is_asset_name(name) {
+                files.push((path, size));
+                if files.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    files
 }
 
 fn engine_loader(host: &Host, args: &Value) -> Result<String, ToolError> {
