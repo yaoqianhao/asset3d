@@ -1,4 +1,4 @@
-//! 视口进程需要的三个 Win32 能力：命名管道**服务端**、会话互斥体、管道名规范化。
+﻿//! 视口进程需要的三个 Win32 能力：命名管道**服务端**、会话互斥体、管道名规范化。
 //!
 //! 与插件侧的 `src/pipe.rs`（客户端）是同一套约定的两端，改动要成对：
 //! 客户端每次命令开一条短连接、写一行、断开；这里的读循环按「读到 EOF 收工、
@@ -22,6 +22,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -324,6 +325,87 @@ fn wake_pipe() {
     });
 }
 
+/// `OPENFILENAMEW`：字段顺序与 `commdlg.h` 逐字段对应，`repr(C)` 负责补齐
+/// 64 位下的 4 字节 padding。手写这份结构是「不引 windows-sys」的代价。
+#[repr(C)]
+struct OpenFileNameW {
+    struct_size: u32,
+    owner: isize,
+    instance: isize,
+    filter: *const u16,
+    custom_filter: *mut u16,
+    max_custom_filter: u32,
+    filter_index: u32,
+    file: *mut u16,
+    max_file: u32,
+    file_title: *mut u16,
+    max_file_title: u32,
+    initial_dir: *const u16,
+    title: *const u16,
+    flags: u32,
+    file_offset: u16,
+    file_extension: u16,
+    default_ext: *const u16,
+    custom_data: isize,
+    hook: *const core::ffi::c_void,
+    template_name: *const u16,
+    reserved: *mut core::ffi::c_void,
+    reserved_u32: u32,
+    flags_ex: u32,
+}
+
+/// `OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_EXPLORER`。
+///
+/// `NOCHANGEDIR` 会顺手把「选完文件后进程当前目录被改掉」这个老坑堵上——视口的
+/// 相对路径解析依赖启动目录不变。
+const OFN_FLAGS: u32 = 0x0008_1a08;
+
+/// 弹系统「打开文件」对话框，返回用户选中的路径；取消返回 `None`。
+///
+/// 为什么需要它：无参双击 `asset3d-gui.exe` 时，用户的第一期望是「让我挑个模型」，
+/// 而不是「给我一个空窗口，什么也点不了」。对话框是模态的、会阻塞事件循环——这在
+/// 主线程上可接受：此形态没有宿主在等管道回包（宿主 spawn 一律带 `--pipe`）。
+pub fn pick_asset_file(owner: isize, title: &str, filter: &str) -> Option<PathBuf> {
+    let mut buffer = vec![0u16; 32 * 1024];
+    let filter = wide(filter);
+    let title = wide(title);
+    let default_ext = wide("glb");
+    let mut ofn = OpenFileNameW {
+        struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+        owner,
+        instance: 0,
+        filter: filter.as_ptr(),
+        custom_filter: std::ptr::null_mut(),
+        max_custom_filter: 0,
+        filter_index: 1,
+        file: buffer.as_mut_ptr(),
+        max_file: buffer.len() as u32,
+        file_title: std::ptr::null_mut(),
+        max_file_title: 0,
+        initial_dir: std::ptr::null(),
+        title: title.as_ptr(),
+        flags: OFN_FLAGS,
+        file_offset: 0,
+        file_extension: 0,
+        default_ext: default_ext.as_ptr(),
+        custom_data: 0,
+        hook: std::ptr::null(),
+        template_name: std::ptr::null(),
+        reserved: std::ptr::null_mut(),
+        reserved_u32: 0,
+        flags_ex: 0,
+    };
+    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
+        // 取消与「对话框打不开」都是 0：两种都当「没选」，不弹错误框打扰。
+        return None;
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    if length == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+
 fn write_all(handle: isize, bytes: &[u8]) -> bool {
     let mut written: u32 = 0;
     let ok = unsafe {
@@ -389,6 +471,38 @@ extern "system" {
     ) -> isize;
     fn GetLastError() -> u32;
     fn CloseHandle(object: isize) -> i32;
+}
+
+// `comdlg32`：只借一个「打开文件」对话框。与上面的 kernel32 分开写 `#[link]`，
+// 因为两者是不同 DLL——合在一个块里会让链接器去 kernel32 找 `GetOpenFileNameW`。
+#[link(name = "comdlg32")]
+extern "system" {
+    fn GetOpenFileNameW(ofn: *mut OpenFileNameW) -> i32;
+}
+
+/// `MB_OK | MB_ICONERROR | MB_SETFOREGROUND`：置前是必要的——双击启动时窗口刚
+/// 建出来，不带它的话消息框可能藏在新窗口后面。
+const MB_ICONERROR: u32 = 0x0000_0010;
+const MB_SETFOREGROUND: u32 = 0x0001_0000;
+
+/// 弹一个阻塞式错误框。只给**没有管道**的形态用（双击 / standalone）：
+/// 这两种形态没有人读 stderr，只写日志等于用户什么都没看到。
+pub fn show_error(owner: isize, title: &str, message: &str) {
+    let text = wide(message);
+    let caption = wide(title);
+    unsafe {
+        MessageBoxW(
+            owner,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW(owner: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
 }
 
 #[cfg(test)]

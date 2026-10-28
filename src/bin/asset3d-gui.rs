@@ -4,19 +4,26 @@
 //! stdio 帧泵里两边只会互相等死。两个进程之间只有一条命名管道，协议见
 //! [`viewport::protocol`]（`docs/24 §5.2`）。
 //!
-//! 这一刀（M-UI-3 第 1 刀）的判据是「进程能起、窗口能开、管道能连」，所以渲染侧
-//! 只清屏、`open` 只记录路径不解析资产——把进程/协议问题与图形问题分开验，
-//! 免得一次失败要在三个层面里猜。
-//!
-//! 三种启动形态（argv 区分，`docs/24 §5.3.1`）：
+//! ## 三种启动形态（argv 区分，`docs/24 §5.3.1`）
 //!
 //! | argv | 形态 | 行为 |
 //! |---|---|---|
-//! | `--pipe <name>` | IDE 托管 | 监听指定管道，IDE 断开后进程继续存活 |
-//! | `--standalone <asset>` | 独立看图 | 不建管道，启动即 `open`，窗口标题带资产名 |
-//! | 无参数 | 手动双击 | 抢 `Local\asset3d.viewport`；抢不到就把已有窗口置前后退出 |
+//! | `--pipe <name>` | IDE 托管 | 监听指定管道，`open` 指令决定画面；IDE 断开后进程继续存活 |
+//! | `--standalone <asset>` | 独立看图 | 不建管道，启动即打开该资产；同一资产只开一个窗口 |
+//! | 无参数 | 手动双击 | 抢 `Local\asset3d.viewport`；抢不到就把已有窗口置前后退出；抢到就弹文件对话框 |
 //!
 //! 参数错误退出码 2、路径错误 3（`docs/24 §5.3.1` 约束 1/2）；正常退出 0。
+//!
+//! ## 交互（第二刀）
+//!
+//! 左键拖动转视角、滚轮推拉、`O` 打开文件、拖文件进窗口直接看、`Esc` 清空。
+//! 这一刀只做静态网格：不播动画、不采样贴图——判据是「打开资产能看出形状」。
+//! 没有资产时不再是一个「什么都没反应」的空窗口：双击形态启动即弹文件对话框，
+//! 窗口标题也写明了拖入 / `O` 两种入口。
+
+// 双击启动时不要闪一个黑控制台：release 走 GUI 子系统，日志交给宿主（托管形态下
+// stdio 本来就是 `ignore`）。debug 构建保留控制台，`eprintln` 还能当场看见。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 // 复用插件侧的管道客户端：无参形态抢不到互斥体时，用它给已有实例发一帧 `focus`。
 // 客户端与视口服务端是同一套约定的两端，能复用就不抄第二份。
@@ -25,19 +32,38 @@
 // `PIPE_PREFIX` 之类只有插件 crate 自用——bin 里没用上不代表该删，故整模块放行。
 #[allow(dead_code)]
 mod pipe;
+// 资产解析链（与 `main.rs` 的 `mod` 列表同源）：视口要自己解析资产，不能只靠
+// 宿主的 `tools` 输出——两个 exe 是独立编译单元，没有可共享的 crate 边界。
+// 复用源文件而不是复制一份，保证「宿主读出来的 AIR」与「视口画出来的形状」永远一致。
+#[path = "../air.rs"]
+#[allow(dead_code)]
+mod air;
+#[path = "../fbx.rs"]
+#[allow(dead_code)]
+mod fbx;
+#[path = "../gltf.rs"]
+#[allow(dead_code)]
+mod gltf;
+#[path = "../util.rs"]
+#[allow(dead_code)]
+mod util;
+
 mod viewport;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use viewport::camera::Orbit;
 use viewport::gfx::Gfx;
 use viewport::protocol::{self, Request};
+use viewport::scene;
 use viewport::win32::{self, InstanceLock, LineHandler, PipeServer};
 
 /// 参数互斥 / 缺值：退出码 2（与 `getopt` 系工具的约定一致）。
@@ -48,20 +74,20 @@ const EXIT_BAD_PATH: i32 = 3;
 /// 窗口默认尺寸：够看一个模型，又不会在 1080p 上盖满整屏。
 const DEFAULT_SIZE: (f64, f64) = (1100.0, 720.0);
 
-/// 无资产时的窗口标题。
-const TITLE_IDLE: &str = "asset3d 视口";
+/// 无资产时的窗口标题。标题是手动形态唯一的「说明书」——写清入口，避免
+/// 「双击之后什么都没反应」的观感。
+const TITLE_IDLE: &str = "asset3d 视口（拖入模型，或按 O 打开）";
+
+/// 文件对话框的过滤器串。`\0` 分隔：说明 + 通配，双 `\0` 收尾（Win32 约定）。
+const ASSET_FILTER: &str = "3D 资产 (*.glb;*.gltf;*.fbx)\0*.glb;*.gltf;*.fbx\0所有文件 (*.*)\0*.*\0";
 
 /// 进程形态。
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum Mode {
     /// IDE 托管：监听宿主分配的管道。
     Hosted {
         pipe: String,
         /// 工作区根，用来把 `open` 的工作区相对路径拼成绝对路径。
-        ///
-        /// 宿主当前只 spawn `--pipe <name>`（`viewport-host.ts`），**没传这一项**，
-        /// 所以托管形态下相对路径暂时解析不了——这一刀 `open` 本来也不读盘，
-        /// 排在 M-UI-3 第二刀（真解析）之前必须补上，否则视口拿到的是相对路径。
         workspace: Option<PathBuf>,
     },
     /// 独立看图：不建管道、不抢视口互斥体。
@@ -174,8 +200,11 @@ fn main() {
         gfx: None,
         pipe: pipe_server,
         current: None,
+        camera: viewport::gfx::idle_camera(),
+        dragging: false,
+        last_cursor: None,
+        pending_open: false,
     };
-    app.seed_standalone();
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("asset3d-gui: 事件循环异常终止：{err}");
         std::process::exit(1);
@@ -216,18 +245,18 @@ struct ViewportApp {
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
     pipe: Option<PipeServer>,
-    /// 当前资产（已解析成绝对路径；解析不了时保留原样）。
+    /// 当前资产（绝对路径）。
     current: Option<String>,
+    camera: Orbit,
+    /// 左键是否按下：拖拽只在按下期间转视角，移开鼠标不会误转。
+    dragging: bool,
+    /// 上一帧的光标位置（物理像素）。用来把「光标位置」变成「增量」。
+    last_cursor: Option<PhysicalPosition<f64>>,
+    /// 手动形态的首帧画完后要弹文件选择器。延后一帧的理由见 `resumed`。
+    pending_open: bool,
 }
 
 impl ViewportApp {
-    /// `--standalone` 形态启动即打开，不经过管道。
-    fn seed_standalone(&mut self) {
-        if let Mode::Standalone { asset, .. } = &self.mode {
-            self.current = Some(asset.to_string_lossy().to_string());
-        }
-    }
-
     fn window_title(&self) -> String {
         match &self.current {
             Some(path) => {
@@ -235,7 +264,7 @@ impl ViewportApp {
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.clone());
-                format!("{name} — {TITLE_IDLE}")
+                format!("{name} — asset3d 视口")
             }
             None => TITLE_IDLE.to_string(),
         }
@@ -251,9 +280,9 @@ impl ViewportApp {
 
     /// 把 `open` 的路径按形态解析成绝对路径。
     ///
-    /// 解析不出来时**不报错**：这一刀 `open` 只记录不读盘，路径对不对要等
-    /// M-UI-3 第二刀真去打开文件时才知道。但要在 stderr 留一行，免得第二刀
-    /// 排查时误以为是解析逻辑丢了。
+    /// 宿主当前只 spawn `--pipe <name>`，**没传 `--workspace`**：这种情况下工作区
+    /// 相对路径解析不出来，只能保留原样并打日志——真读盘时会以 `file_missing`
+    /// 明确失败，而不是悄悄打开一个错的路径。
     fn resolve(&self, path: &str) -> String {
         let raw = PathBuf::from(path);
         if raw.is_absolute() {
@@ -274,8 +303,68 @@ impl ViewportApp {
         }
     }
 
-    fn abs_exists(&self, resolved: &str) -> bool {
-        Path::new(resolved).is_file()
+    /// 解析资产并上传到 GPU。失败时**保持现有画面**：打不开的文件不该把已经
+    /// 看得见的东西弄丢。
+    fn load(&mut self, path: &Path) -> Result<(), String> {
+        let scene = scene::load(path)?;
+        if let Some(gfx) = &mut self.gfx {
+            gfx.set_scene(&scene);
+        }
+        self.camera = Orbit::fit(scene.center, scene.radius);
+        self.current = Some(path.to_string_lossy().to_string());
+        if let Some(window) = &self.window {
+            window.set_title(&self.window_title());
+            window.request_redraw();
+        }
+        eprintln!(
+            "asset3d-gui: 已载入 {}（{} 个网格 / {} 个三角形）",
+            path.display(),
+            scene.mesh_count,
+            scene.triangle_count
+        );
+        Ok(())
+    }
+
+    fn unload(&mut self) {
+        if let Some(gfx) = &mut self.gfx {
+            gfx.clear_scene();
+        }
+        self.camera = viewport::gfx::idle_camera();
+        self.current = None;
+        if let Some(window) = &self.window {
+            window.set_title(TITLE_IDLE);
+            window.request_redraw();
+        }
+    }
+
+    /// 报错：有管道就回协议错误帧，没有管道（双击 / standalone）就弹系统消息框——
+    /// 双击启动时 stderr 没人看得见。
+    fn report(&self, seq: u64, code: &str, message: &str) {
+        if self.pipe.is_some() {
+            self.push_frame(protocol::error_frame(seq, code, message));
+        } else {
+            win32::show_error(hwnd_of_opt(self.window.as_deref()), "asset3d 视口", message);
+        }
+    }
+
+    /// 弹「打开文件」对话框并载入选中的资产。用户取消就什么都不做。
+    fn ask_for_file(&mut self) {
+        let owner = hwnd_of_opt(self.window.as_deref());
+        let Some(path) = win32::pick_asset_file(owner, "打开 3D 资产", ASSET_FILTER) else {
+            return;
+        };
+        match self.load(&path) {
+            Ok(()) => self.push_frame(protocol::state_frame(
+                &path.to_string_lossy(),
+                None,
+                0.0,
+                false,
+            )),
+            Err(err) => {
+                eprintln!("asset3d-gui: 打开 {} 失败：{err}", path.display());
+                self.report(0, "load_failed", &err);
+            }
+        }
     }
 
     fn on_request(&mut self, req: Request) {
@@ -291,8 +380,8 @@ impl ViewportApp {
                     return;
                 }
                 let resolved = self.resolve(&path);
-                let absolute = Path::new(&resolved).is_absolute();
-                if absolute && !self.abs_exists(&resolved) {
+                let raw = Path::new(&resolved);
+                if raw.is_absolute() && !raw.is_file() {
                     self.push_frame(protocol::error_frame(
                         seq,
                         "file_missing",
@@ -300,26 +389,22 @@ impl ViewportApp {
                     ));
                     return;
                 }
-                self.current = Some(resolved);
-                if let Some(window) = &self.window {
-                    window.set_title(&self.window_title());
-                    window.request_redraw();
+                // 这一刀没有动画通道：`animation` 只回显进 `state`，不影响画面。
+                match self.load(raw) {
+                    Ok(()) => self.push_frame(protocol::state_frame(
+                        &path,
+                        animation.as_deref(),
+                        0.0,
+                        play,
+                    )),
+                    Err(err) => {
+                        eprintln!("asset3d-gui: 打开 {resolved} 失败：{err}");
+                        self.push_frame(protocol::error_frame(seq, "load_failed", &err));
+                    }
                 }
-                // `state` 是单向帧（seq=0）：`open` 的成功回执就是它，协议里没有
-                // 单独的 `ack`——`docs/24 §5.2` 的 op 表里只有这几条。
-                self.push_frame(protocol::state_frame(
-                    &path,
-                    animation.as_deref(),
-                    0.0,
-                    play,
-                ));
             }
             Request::Close { .. } => {
-                self.current = None;
-                if let Some(window) = &self.window {
-                    window.set_title(TITLE_IDLE);
-                    window.request_redraw();
-                }
+                self.unload();
                 self.push_frame(protocol::state_frame("", None, 0.0, false));
             }
             Request::Focus { .. } => {
@@ -329,6 +414,12 @@ impl ViewportApp {
             }
             // `ping` / `screenshot` / 未知 op 已在读线程处理，走到这里说明是重复投递。
             Request::Ping { .. } | Request::Screenshot { .. } | Request::Unknown => {}
+        }
+    }
+
+    fn redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 }
@@ -354,12 +445,32 @@ impl ApplicationHandler<UserEvent> for ViewportApp {
             Err(err) => {
                 // 建不出 GPU 设备就没有任何可看的：报清楚原因再退，不留在白窗口上。
                 eprintln!("asset3d-gui: {err}");
+                win32::show_error(hwnd_of(&window), "asset3d 视口无法启动", &err);
                 event_loop.exit();
                 return;
             }
         }
         window.request_redraw();
+        // 先落 window 再弹对话框：对话框要把窗口当 owner，否则会跑到窗口后面去。
         self.window = Some(window);
+        // 被别的程序顺带拉起时窗口可能带着「最小化」状态，先自己抢一次焦点。
+        if let Some(window) = &self.window {
+            window.focus_window();
+        }
+
+        match self.mode.clone() {
+            // 无参双击：等第一帧画完再弹文件选择器（见 `pending_open`）。直接在 `resumed`
+            // 里弹是同步模态调用，事件循环被挡住，用户会先看到一块没画过的白板——
+            // 观感和「启动失败」没区别。
+            Mode::Manual => self.pending_open = true,
+            Mode::Standalone { asset, .. } => {
+                if let Err(err) = self.load(&asset) {
+                    eprintln!("asset3d-gui: 打开 {} 失败：{err}", asset.display());
+                    self.report(0, "load_failed", &err);
+                }
+            }
+            Mode::Hosted { .. } => {}
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -383,20 +494,84 @@ impl ApplicationHandler<UserEvent> for ViewportApp {
                 if let Some(gfx) = &mut self.gfx {
                     gfx.resize(size);
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.redraw();
             }
             WindowEvent::RedrawRequested => {
                 if let Some(gfx) = &mut self.gfx {
-                    if let Err(err) = gfx.render() {
+                    if let Err(err) = gfx.render(&self.camera) {
                         // 单帧失败不退出：拔显示器、改缩放都会让 surface 抖一下，
                         // 下一次 request_redraw 自然再试。真不可恢复的（显存不足）
                         // 已经由 `Err` 的文案说清了。
                         eprintln!("asset3d-gui: {err}");
                     }
                 }
+                // 第一帧（地板网格）已经在屏幕上了，这时再弹模态对话框：即便用户
+                // 立刻取消，窗口里也有东西可看，而不是一块白板。
+                if self.pending_open {
+                    self.pending_open = false;
+                    self.ask_for_file();
+                }
             }
+            // 拖文件进窗口直接看：比「按 O 再翻目录」快，也是看图工具的通用手势。
+            WindowEvent::DroppedFile(path) => {
+                if let Err(err) = self.load(&path) {
+                    eprintln!("asset3d-gui: 打开 {} 失败：{err}", path.display());
+                    self.report(0, "load_failed", &err);
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.dragging = state == ElementState::Pressed;
+                if !self.dragging {
+                    // 松开时清掉基准点：不然下次按下后的第一帧会拿旧坐标算出一次大跳。
+                    self.last_cursor = None;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.dragging {
+                    if let Some(last) = self.last_cursor {
+                        self.camera.orbit(
+                            (position.x - last.x) as f32,
+                            (position.y - last.y) as f32,
+                        );
+                        self.redraw();
+                    }
+                }
+                self.last_cursor = Some(position);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let steps = match delta {
+                    // 一行 ≈ 一格滚轮；像素级（触控板）按 60px 折算成一格。
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 60.0) as f32,
+                };
+                self.camera.zoom(steps);
+                self.redraw();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key,
+                        ..
+                    },
+                ..
+            } => match logical_key.as_ref() {
+                Key::Character("o") | Key::Character("O") => self.ask_for_file(),
+                Key::Named(NamedKey::Escape) => self.unload(),
+                Key::Named(NamedKey::Home) => {
+                    if let Some(path) = self.current.clone() {
+                        // 重载：既能把视角拉回默认，也能在资产被外部改过后刷新。
+                        if let Err(err) = self.load(Path::new(&path)) {
+                            eprintln!("asset3d-gui: 重载失败：{err}");
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -431,6 +606,21 @@ fn forward_focus() {
     }
 }
 
+/// 取窗口的 Win32 句柄，用于给对话框 / 消息框当 owner。
+fn hwnd_of(window: &Window) -> isize {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get() as isize,
+        // 非 Windows 句柄不该出现（本 crate 只编 Windows），返回 0 表示无 owner：
+        // 对话框照样能用，只是不跟着窗口居中。
+        _ => 0,
+    }
+}
+
+fn hwnd_of_opt(window: Option<&Window>) -> isize {
+    window.map(hwnd_of).unwrap_or(0)
+}
+
 /// 同一资产的 `--standalone` 只开一个窗口：互斥体名按绝对路径哈希。
 fn hash_path(path: &Path) -> u64 {
     // FNV-1a 64：只用来做互斥体名的区分，不需要抗碰撞，也不值得为它拖一个 crate。
@@ -440,6 +630,14 @@ fn hash_path(path: &Path) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// 裸路径参数是否像个 3D 资产：`ASSET_FILTER` 里认的三种扩展名，忽略大小写。
+fn is_asset_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [".glb", ".gltf", ".fbx"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 
 fn take_value(argv: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
@@ -468,6 +666,12 @@ fn parse_mode(argv: &[String]) -> Result<Mode, String> {
                     "用法：asset3d-gui [--pipe <name> | --standalone <asset>] [--workspace <dir>]"
                 );
                 std::process::exit(0);
+            }
+            // 资源管理器把模型拖到 exe 图标上（或文件关联双击）时，argv 就是一个裸路径。
+            // 不认它等于「双击带文件什么也没发生」，所以直接当 `--standalone` 用。
+            other if standalone.is_none() && is_asset_path(other) => {
+                standalone = Some(other.to_string());
+                index += 1;
             }
             other => return Err(format!("未知参数 `{other}`")),
         }
