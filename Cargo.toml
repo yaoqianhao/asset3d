@@ -9,6 +9,12 @@ description = "ai-ide 插件：读取 FBX/GLB 3D 资产，解析并归一化为�
 # 不参与内核的 workspace 依赖图（否则插件的 ufbx/gltf 会污染内核构建）。
 [workspace]
 
+# 视口进程 `asset3d-gui.exe`（docs/24 §5.1）。与插件宿主分进程：winit 的事件
+# 循环会独占线程，塞进 stdio 帧泵里两边只会互相等死。
+[[bin]]
+name = "asset3d-gui"
+path = "src/bin/asset3d-gui.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,6 +23,13 @@ base64 = "0.22"
 ufbx = "0.11"
 # glTF / GLB：纯 Rust 解析
 gltf = { version = "1.4", default-features = false, features = ["names", "utils", "extras"] }
+# 视口：窗口 / 图形 / 数学。只有 `asset3d-gui` 用，宿主形态也会被链进来，
+# 三者的运行时开销都在初始化路径上，帧泵不碰它们。
+winit = "0.30"
+wgpu = "22"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.29", features = ["bytemuck"] }
 
 [profile.release]
 opt-level = 2

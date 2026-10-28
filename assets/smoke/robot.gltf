@@ -1,0 +1,6 @@
+{
+  "asset": { "version": "2.0", "generator": "asset3d viewport smoke fixture" },
+  "scene": 0,
+  "scenes": [{ "name": "smoke", "nodes": [] }],
+  "nodes": []
+}
