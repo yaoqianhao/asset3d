@@ -1,11 +1,16 @@
 ﻿//! 视口的图形侧：surface + 一条网格管线 + 一份深度缓冲。
 //!
 //! M-UI-3 第一刀只做「窗口能出像素」（清屏）；第二刀补上静态网格与相机：顶点/索引
-//! 缓冲一次性上传，相机每帧只改 uniform——不做骨骼动画、不采样贴图，材质通道留到
-//! 后续刀（先让「打开资产能看出形状」这件事成立）。
+//! 缓冲一次性上传，相机每帧只改 uniform；第三刀补上材质贴图：场景按材质切成若干
+//! 分区，每个分区一份 `baseColor` uniform + 一张贴图，换分区只换 bind group。
+//!
+//! 仍然不做骨骼动画、不做透明排序、不做 PBR——判据是「打开资产能看出长什么样」，
+//! 不是「还原渲染引擎」。贴图与材质 uniform 的生命周期跟着 `GpuScene` 走：换资产时
+//! 整批替换，显存不会随打开次数增长。
 //!
 //! 渲染只在被要求时发生（`request_redraw`）：静止时 GPU 空闲，笔记本风扇不会一直转。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -15,7 +20,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use super::camera::Orbit;
-use super::scene::{reference_grid, Scene, Vertex};
+use super::scene::{reference_grid, Scene, TexImage, Vertex};
 
 /// 视口底色：深蓝灰（sRGB）。比纯黑更容易看出「是视口，不是窗口没画」。
 const CLEAR: wgpu::Color = wgpu::Color {
@@ -45,11 +50,42 @@ struct Uniforms {
     light: [f32; 4],
 }
 
+/// 逐分区的材质参数。16 字节对齐（`vec4`）是 uniform 布局的硬要求，
+/// 所以哪怕只有一个 `baseColor` 也用 4 个 f32。
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MaterialUniform {
+    base_color: [f32; 4],
+}
+
+/// 参考地板的顶点：位置 + 顶点色。与模型顶点分开布局——网格线不需要 UV，
+/// 硬塞进 32 字节的 `Vertex` 只是白白多传一份数据，还得让网格着色器声明一个
+/// 用不到的输入。
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GridVertex {
+    pos: [f32; 3],
+    color: [f32; 3],
+}
+
+/// 上传到 GPU 的一个分区：索引区间 + 它自己的材质 bind group。
+struct GpuPart {
+    index_start: u32,
+    index_count: u32,
+    /// 多个分区共用同一材质时指向同一份 bind group。
+    bind: Arc<wgpu::BindGroup>,
+}
+
 /// 上传到 GPU 的一份场景。
 struct GpuScene {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
+    parts: Vec<GpuPart>,
+    /// 索引总数：分区之外的兜底绘制用（正常情况下分区覆盖全部三角形）。
     index_count: u32,
+    /// 各材质的 uniform 缓冲。只为持有生命周期，渲染时不直接读。
+    #[allow(dead_code)]
+    material_uniforms: Vec<wgpu::Buffer>,
 }
 
 /// 渲染器。`surface` 用 `'static`：持有一份 `Arc<Window>` 的克隆，
@@ -65,6 +101,13 @@ pub struct Gfx {
     pipeline: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// 材质绑定的布局与两件「兜底资源」：1×1 白纹理、线性重复采样器。
+    /// 没有贴图的材质也照样绑一组，着色器里就不需要 `has_texture` 分支。
+    material_layout: wgpu::BindGroupLayout,
+    white_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    /// 默认材质的 bind group：场景没有分区（或分区不完整）时直接用它。
+    fallback_bind: wgpu::BindGroup,
     depth: Option<wgpu::TextureView>,
     scene: Option<GpuScene>,
     /// 参考地板：常驻的一条线段缓冲。没有模型的空窗口靠它证明「视口活着」，
@@ -163,9 +206,86 @@ impl Gfx {
             }],
         });
 
+        // ---- 材质（group 1）：uniform + 贴图 + 采样器 ----
+        let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("asset3d-viewport-material-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        // 每个材质只传一张 2D 贴图，不做数组/立方体。
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let white_view = create_white_texture(&device, &queue);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("asset3d-viewport-sampler"),
+            // Repeat：UV 在 0..1 之外时，贴图重复而不是夹边——提花类资产的 UV
+            // 常故意超出 1，夹边会出现一条拉长的色带。
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let fallback_bind = {
+            let material = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("asset3d-viewport-fallback-material"),
+                contents: bytemuck::bytes_of(&MaterialUniform {
+                    // 与第一刀的冷灰蓝一致：没有材质的资产看起来不该和上一版有差别。
+                    base_color: [0.62, 0.68, 0.78, 1.0],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("asset3d-viewport-fallback-bind"),
+                layout: &material_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: material.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&white_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            })
+        };
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("asset3d-viewport-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &material_layout],
             push_constant_ranges: &[],
         });
 
@@ -189,6 +309,12 @@ impl Gfx {
                             format: wgpu::VertexFormat::Float32x3,
                             offset: 12,
                             shader_location: 1,
+                        },
+                        // UV：偏移量跟着 `Vertex` 的字段顺序走（3+3 个 f32 = 24 字节）。
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 24,
+                            shader_location: 2,
                         },
                     ],
                 }],
@@ -230,18 +356,25 @@ impl Gfx {
             label: Some("asset3d-viewport-grid-shader"),
             source: wgpu::ShaderSource::Wgsl(GRID_SHADER.into()),
         });
+        // 地板只吃 group 0：单独一份 layout，免得每帧为了「凑齐两组绑定」
+        // 白绑一次材质——多绑一次也就多一次状态校验，但没必要。
+        let grid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("asset3d-viewport-grid-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
         // 地面网格：线段，无光照，**不写深度**。写深度的后果是模型贴地的那层三角形
         // 会被网格线「提前占位」打洞（1 米一格的线正好穿过脚底）；只读深度的
         // `LessEqual` 让网格被模型挡住，又不影响后面的模型绘制。
         let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("asset3d-viewport-grid-pipeline"),
-            layout: Some(&layout),
+            layout: Some(&grid_layout),
             vertex: wgpu::VertexState {
                 module: &grid_shader,
                 entry_point: "vs_grid",
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    array_stride: std::mem::size_of::<GridVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         wgpu::VertexAttribute {
@@ -289,9 +422,19 @@ impl Gfx {
         });
 
         let grid = reference_grid();
+        // 场景侧的顶点是 32 字节的 `Vertex`（带 UV），地板只留位置 + 颜色。
+        let packed: Vec<GridVertex> = grid
+            .vertices
+            .iter()
+            .map(|vertex| GridVertex {
+                pos: vertex.pos,
+                color: vertex.normal,
+            })
+            .collect();
+        let grid_vertex_count = packed.len() as u32;
         let grid_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("asset3d-viewport-grid-vertices"),
-            contents: bytemuck::cast_slice(&grid.vertices),
+            contents: bytemuck::cast_slice(&packed),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
@@ -306,15 +449,22 @@ impl Gfx {
             pipeline,
             uniforms,
             bind_group,
+            material_layout,
+            white_view,
+            sampler,
+            fallback_bind,
             depth: Some(depth),
             scene: None,
             grid_pipeline,
             grid_vertices,
-            grid_vertex_count: grid.vertices.len() as u32,
+            grid_vertex_count,
         })
     }
 
     /// 把解析好的场景传上 GPU。旧缓冲在这里被替换，显存跟着最新的资产走。
+    ///
+    /// 细微处：材质按 `key` 去重。一个资产里 200 个网格共用 3 个材质是常态，
+    /// 每个分区各建一份 bind group 会把同一张 2K 贴图上传 200 次——显存直接爆。
     pub fn set_scene(&mut self, scene: &Scene) {
         let vertices = self
             .device
@@ -330,10 +480,78 @@ impl Gfx {
                 contents: bytemuck::cast_slice(&scene.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+
+        // bind group 本身不实现 Clone（wgpu 22 的资源句柄都是唯一所有者），
+        // 所以共享同一个材质时用 Arc 传引用，而不是复制一份 GPU 资源。
+        let mut cache: HashMap<usize, Arc<wgpu::BindGroup>> = HashMap::new();
+        let mut material_uniforms: Vec<wgpu::Buffer> = Vec::new();
+        let mut parts: Vec<GpuPart> = Vec::with_capacity(scene.parts.len());
+        for part in &scene.parts {
+            let bind = match cache.get(&part.material.key) {
+                Some(bind) => Arc::clone(bind),
+                None => {
+                    let uniform = self
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("asset3d-viewport-material"),
+                            contents: bytemuck::bytes_of(&MaterialUniform {
+                                base_color: part.material.base_color,
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                    // 贴图视图只在建 bind group 时借出去一次，之后由 bind group
+                    // 自己持有，所以这里不需要（也无法）clone 句柄。
+                    let uploaded = part
+                        .material
+                        .texture
+                        .as_ref()
+                        .map(|image| upload_texture(&self.device, &self.queue, image));
+                    // 没贴图就绑白纹理：`byte × 1.0` 等于只用 baseColor。
+                    let view = uploaded.as_ref().unwrap_or(&self.white_view);
+                    let bind = Arc::new(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        // 用材质名做调试标签：抓帧（RenderDoc / PIX）时能直接看出
+                        // 哪一段是哪个材质，比 20 个同名 "material-bind" 强。
+                        label: Some(if part.material.name.is_empty() {
+                            "asset3d-viewport-material-bind"
+                        } else {
+                            &part.material.name
+                        }),
+                        layout: &self.material_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: uniform.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    }));
+                    cache.insert(part.material.key, Arc::clone(&bind));
+                    material_uniforms.push(uniform);
+                    bind
+                }
+            };
+            parts.push(GpuPart {
+                index_start: part.index_start,
+                index_count: part.index_count,
+                bind,
+            });
+        }
+
         self.scene = Some(GpuScene {
             vertices,
             indices,
+            parts,
             index_count: scene.indices.len() as u32,
+            // 缓冲句柄留着：bind group 会自己抓住资源，但保留一份引用能避免
+            // 「绑定还在、缓冲先被回收」这种只在特定后端出现的时序问题。
+            material_uniforms,
         });
     }
 
@@ -426,13 +644,98 @@ impl Gfx {
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, scene.vertices.slice(..));
                 pass.set_index_buffer(scene.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..scene.index_count, 0, 0..1);
+                if scene.parts.is_empty() {
+                    // 兜底：`scene::merge` 保证有三角形就至少一个分区，这条分支只是
+                    // 防「将来改坏了 → 整块黑屏」的保险丝。
+                    pass.set_bind_group(1, &self.fallback_bind, &[]);
+                    pass.draw_indexed(0..scene.index_count, 0, 0..1);
+                } else {
+                    // 一个分区一个 draw call：换材质只换 bind group，不重建管线、
+                    // 不重传缓冲。几十个材质的资产也就是几十次切换，肉眼无感。
+                    for part in &scene.parts {
+                        pass.set_bind_group(1, part.bind.as_ref(), &[]);
+                        pass.draw_indexed(
+                            part.index_start..part.index_start + part.index_count,
+                            0,
+                            0..1,
+                        );
+                    }
+                }
             }
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
     }
+}
+
+/// 上传一张解码好的贴图。格式取 `Rgba8UnormSrgb`：像素字节原样（PNG 就是 sRGB），
+/// 采样时由硬件转成线性，与着色器里的线性光照计算对齐。
+fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, image: &TexImage) -> wgpu::TextureView {
+    let width = image.width.max(1);
+    let height = image.height.max(1);
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("asset3d-viewport-texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // 不做 mipmap：没有多级渐远，远处贴图会有摩尔纹，但生成 mip 链要多一个
+    // 计算管线 + 一次全链复制，对「看一眼资产」这个目标不划算。
+    queue.write_texture(
+        texture.as_image_copy(),
+        &image.rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// 1×1 白纹理：没有贴图的材质也绑一张，着色器的采样路径就恒定不用分支。
+fn create_white_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("asset3d-viewport-white"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // 必须真写进去：新建纹理的内容是未定义的，某些驱动上会全 0（材质全黑）。
+    queue.write_texture(
+        texture.as_image_copy(),
+        &[255u8, 255, 255, 255],
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 fn create_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {

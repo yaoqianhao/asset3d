@@ -14,10 +14,12 @@
 //!
 //! 参数错误退出码 2、路径错误 3（`docs/24 §5.3.1` 约束 1/2）；正常退出 0。
 //!
-//! ## 交互（第二刀）
+//! ## 交互（第二刀 / 第三刀）
 //!
 //! 左键拖动转视角、滚轮推拉、`O` 打开文件、拖文件进窗口直接看、`Esc` 清空。
-//! 这一刀只做静态网格：不播动画、不采样贴图——判据是「打开资产能看出形状」。
+//! 第二刀到「打开资产能看出形状」为止（纯色几何 + 参考网格）；第三刀补上材质贴图：
+//! 顶点带 UV，按 AIR 的 `material_parts` 分区各配一份 baseColor 与贴图，缺图退回纯色。
+//! 仍然只画静态网格——不播动画、不做蒙皮，`capabilities` 也只报 `static`。
 //! 没有资产时不再是一个「什么都没反应」的空窗口：双击形态启动即弹文件对话框，
 //! 窗口标题也写明了拖入 / `O` 两种入口。
 
@@ -317,11 +319,17 @@ impl ViewportApp {
             window.request_redraw();
         }
         eprintln!(
-            "asset3d-gui: 已载入 {}（{} 个网格 / {} 个三角形）",
+            "asset3d-gui: 已载入 {}（{} 个网格 / {} 个三角形 / {} 张贴图）",
             path.display(),
             scene.mesh_count,
-            scene.triangle_count
+            scene.triangle_count,
+            scene.texture_count
         );
+        // 贴图缺失、尺寸超限这类问题不影响开窗，但会让资产看起来是纯色的。
+        // 不打出来，用户第一反应就是「视口坏了」。
+        for note in &scene.notes {
+            eprintln!("asset3d-gui: 提示：{note}");
+        }
         Ok(())
     }
 

@@ -30,6 +30,9 @@ wgpu = "22"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.29", features = ["bytemuck"] }
+# 贴图解码：视口要把 PNG/JPEG 变成 RGBA8 再传 GPU。只开 png/jpeg 两个特性，
+# 其余格式（tiff/webp/avif…）对 3D 资产的 baseColor 没意义，开了只拖编译时间。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [profile.release]
 opt-level = 2

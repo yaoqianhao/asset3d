@@ -13,6 +13,36 @@ AIGC:
 
 格式参考 Keep a Changelog，版本遵循语义化版本。`AIRB` 格式与 `pluginApi` 的兼容性单独标注。
 
+## [0.4.0] - 2026-10-28
+
+本版把「面板里只有一棵描述树」补成了「能看见形状」：新增独立视口进程 `asset3d-gui.exe`，宿主按 `views[].external` 拉起它，两者以命名管道跑会话协议 `asset3d.session/1`；视口从「空窗口」一路做到网格 + 材质贴图 + 轨道相机 + 包围盒取景。`pluginApi` 升到 `1.1`（新增 `views` 与 `commands`），`AIRB` 仍为 `v1`——视口只消费既有 AIR 字段，不改格式。
+
+### 新增
+
+- **视口进程 `asset3d-gui.exe`**（独立 `[[bin]]`，winit + wgpu）：不与插件同进程——winit 的事件循环要独占线程，塞进宿主 stdio 帧泵里两边只会互相等死。三种启动形态：`--pipe <name>`（IDE 托管）、`--standalone <asset>`（独立看图，同资产只开一个窗口）、无参数（双击，抢 `Local\asset3d.viewport` 互斥体，抢不到就把已有窗口置前后退出）。退出码：参数错误 `2`、路径错误 `3`、正常 `0`。
+- **会话协议 `asset3d.session/1`**：行分隔 JSON `{"v":1,"op":"...","seq":N,...}`，op 为 `open` / `close` / `focus` / `ping` / `screenshot`。三条硬规则落在代码里：未知 op 与未知字段一律忽略（协议要能往前加）、`seq=0` 为单向通知不回包、`seq>0` 按同 `seq` 回；`screenshot` 本期是占位，明确回 `error{code:"unsupported"}` 而不是静默超时；握手 `ready.capabilities` 只报 `["static"]`。
+- **网格渲染**：顶点带位置/法线/UV，按 AIR 的 `material_parts` 把同一 mesh 切成若干索引区间，一段一个 draw call，材质相同的分区共用 bind group 与 uniform。
+- **材质贴图**：`scene.rs` 解析纹理解码，`gfx.rs` 新增 sampler + texture bind group。贴图读取优先级为「内嵌 base64 → 资产同目录的相对 `uri`」，外部 `uri` 只允许落在资产同目录，越界当读不到；UV 按 AIR 的 `units.uv_origin` 决定是否翻 v（读字段不猜格式名）；缺贴图退回 baseColor 纯色，贴图损坏只记一条 `notes`，不放大成打不开。
+- **轨道相机与取景**：`Orbit::fit` 按包围球自动定距离与近远裁剪面，左键拖动转视角、滚轮推拉，不同尺度资产都不用先手动调距离。
+- **参考地板与坐标轴**：1 米一格地面网格 + X 轴红 / Z 轴蓝；空窗口与 `Esc` 清空后都靠它证明程序还活着。
+- **面板视图入口 `view_render` 工具**：把资产折成声明式描述树（概览/材质/贴图/动画/骨骼/导入问题/动作按钮）交给宿主面板渲染，`path` 省略时列出工作区可打开资产。
+- **`open_viewport` 命令**：把资产路径发给已启动的视口；视口没起来先由宿主拉起进程，`pipe` 省略时发默认管道（手动双击那个窗口）。
+- **单测补 13 条**：`scene` 侧覆盖分区切分（`material_parts`）、UV 翻转、越界索引丢弃、贴图解码降级、`percent_decode` 等；`asset3d-gui` 侧共 38 条、插件主 crate 44 条全绿。
+
+### 变更
+
+- 版本号升到 `0.4.0`（`Cargo.toml` 为唯一真源），`pluginApi` 由 `1.0` 升到 `1.1`，`dist/` 打包清单多一件 `asset3d-gui.exe`。
+- `Cargo.toml` 新增视口依赖与 `image` 的 `png` / `jpeg` 解码特性（贴图在视口侧要展开成 RGBA，插件侧仍只搬字节）。
+- `README.md` 新增「视口：asset3d-gui.exe」一节（启动形态、交互、协议表、画面构成、取舍），工具表补到 6 个并单列 `commands`，版本与已知限制同步更新。
+- 视口复用插件源文件的 `air` / `fbx` / `gltf` / `util` / `pipe` 模块（`#[path]` 引入），保证「宿主读出来的 AIR」与「视口画出来的形状」永远一致，不复制第二份解析器。
+
+### 已知限制
+
+- 视口只做**静态渲染**：不播动画、不做蒙皮；`capabilities` 只报 `static`，动画留给 M-UI-4。
+- 贴图超过 4096×4096 不解码，画面上退回纯色并在 `notes` 里给原因。
+- 不排序半透明（alpha 一律当不透明）、不打 mipmap（远处贴图有摩尔纹）。
+- `screenshot` op 为协议占位，本节要图请用系统截图。
+
 ## [0.3.0] - 2026-10-27
 
 本版把「单体资产读不进来」这个天花板拆掉了：宿主新增了 `host/fs.read` 的 `offset` 与 `host/fs.write` 的 `append` / `offset`，插件侧改成循环分片读写，上限从约 720 KiB 抬到 96 MiB，并对旧宿主保留整文件降级路径。`pluginApi` 仍为 `1.0`，`AIRB` 仍为 `v1`——只改读写方式，不改格式与约定。
