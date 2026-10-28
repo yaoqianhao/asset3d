@@ -450,14 +450,17 @@ fn handshake_result() -> Value {
 /// 生成 `plugin.json` 的内容：与 [`tools::catalog`] 同源，不手工维护第二份。
 ///
 /// `pathField` 只给写盘工具填：审批按「哪个文件」落键，读工具不涉及审批。
-/// 视口进程的可执行文件名：`None` = 本轮不声明 `views[].external`。
+/// 视口进程的可执行文件名：`None` = 不声明 `views[].external`。
 ///
 /// 宿主的清单校验要求 `external.program` 在包内**真实存在**（`docs/24 §4.2`
-/// 与宿主 `validate` 的 `views[].external.program` 分支），而视口 GUI 由
-/// M-UI-3 交付。提前声明等于让整个包装不上——校验失败的是「包」而不是
-/// 「视图」这一条，代价太大。等 GUI 进 dist 时把这里改成 `Some(...)` 即可，
-/// 清单其余部分不用动；在改之前，面板照常渲染只读描述树（ADR-16）。
-const VIEW_EXTERNAL_PROGRAM: Option<&str> = None;
+/// 与宿主 `validate` 的 `views[].external.program` 分支），所以这个值必须与
+/// `dist/` 里真实躺着的 exe 同名：`asset3d-gui.exe` 与 `asset3d.exe` 一起躺在
+/// `dist/`，改一边就得同步另一边，否则整个包装不上——校验失败的是「包」而不是
+/// 「视图」这一条。
+///
+/// 做成编译期常量而不是运行时探测：清单由 `asset3d --manifest` 打印，宿主在
+/// 装包之前就要拿到完整声明，不能依赖任何运行时文件存在性判断。
+const VIEW_EXTERNAL_PROGRAM: Option<&str> = Some("asset3d-gui.exe");
 
 /// 视图声明。`external` 只在 [`VIEW_EXTERNAL_PROGRAM`] 有值时出现。
 fn view_entry() -> Value {

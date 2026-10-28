@@ -258,6 +258,10 @@
   "views": [
     {
       "entry": "view_render",
+      "external": {
+        "program": "asset3d-gui.exe",
+        "protocol": "asset3d.session/1"
+      },
       "id": "main",
       "location": "pluginPanel.detail",
       "refresh": [
