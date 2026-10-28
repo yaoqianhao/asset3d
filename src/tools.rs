@@ -1270,6 +1270,7 @@ mod tests {
             tracks: vec![crate::air::AirTrack {
                 node: 1,
                 property: "rotation".to_string(),
+                interpolation: crate::air::INTERPOLATION_LINEAR.to_string(),
                 times: vec![0.0; 5],
                 values: vec![[0.0, 0.0, 0.0, 1.0]; 4],
             }],

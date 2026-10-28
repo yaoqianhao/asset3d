@@ -413,4 +413,46 @@ mod tests {
         encoded.truncate(encoded.len() - 4);
         assert!(decode(&encoded).is_err());
     }
+
+    /// 动画目前整块留在 JSON 头里，但「留在头里」不代表能安全往返：
+    /// 插值语义、时间轴、关键值任何一项掉了，播放端都会静默播错。
+    #[test]
+    fn round_trip_keeps_animation_tracks() {
+        let mut doc = sample();
+        doc.animations.push(crate::air::AirAnimation {
+            name: "walk".to_string(),
+            duration: 1.0,
+            tracks: vec![crate::air::AirTrack {
+                node: 0,
+                property: "translation".to_string(),
+                interpolation: crate::air::INTERPOLATION_STEP.to_string(),
+                times: vec![0.0, 0.5, 1.0],
+                values: vec![
+                    [0.0, 0.0, 0.0, 0.0],
+                    [1.0, 2.0, 3.0, 0.0],
+                    [4.0, 5.0, 6.0, 0.0],
+                ],
+            }],
+        });
+        doc.finalize();
+
+        let encoded = encode(&doc);
+        let back = decode(&encoded.bytes).expect("decode");
+        let a = &doc.animations[0];
+        let b = &back.animations[0];
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.duration, b.duration);
+        assert_eq!(a.tracks.len(), b.tracks.len());
+        assert_eq!(a.tracks[0].times, b.tracks[0].times);
+        assert_eq!(a.tracks[0].values, b.tracks[0].values);
+        assert!(b.tracks[0].is_step(), "STEP 语义必须原样穿过二进制容器");
+        for time in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert_eq!(
+                a.tracks[0].sample_at(time),
+                b.tracks[0].sample_at(time),
+                "t={time} 的采样值往返后变了"
+            );
+        }
+        assert_eq!(back.stats.animation_count, 1);
+    }
 }

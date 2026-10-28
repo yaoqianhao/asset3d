@@ -807,6 +807,8 @@ fn push_track(
     clip.tracks.push(AirTrack {
         node,
         property: property.to_string(),
+        // FBX 的关键帧已按 30fps 烘焙成密集线性帧，插值方式固定 linear。
+        interpolation: crate::air::INTERPOLATION_LINEAR.to_string(),
         times,
         values,
     });
@@ -830,6 +832,7 @@ fn push_rotation_track(clip: &mut AirAnimation, node: u32, keys: &[ufbx::BakedQu
     clip.tracks.push(AirTrack {
         node,
         property: "rotation".to_string(),
+        interpolation: crate::air::INTERPOLATION_LINEAR.to_string(),
         times,
         values,
     });

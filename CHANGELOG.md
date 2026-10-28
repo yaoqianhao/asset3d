@@ -13,6 +13,29 @@ AIGC:
 
 格式参考 Keep a Changelog，版本遵循语义化版本。`AIRB` 格式与 `pluginApi` 的兼容性单独标注。
 
+## [Unreleased]
+
+M-UI-4 第一刀：把动画从「只统计条数」推进到「能按时间点求值」。这一刀不碰渲染，也不动 `AIRB` 布局与 `pluginApi`——判据是：给定一条 AIR 轨道和任意时间，能算出该节点该时刻的 TRS，且这个结果能被单测钉住。
+
+### 新增
+
+- **轨道采样 `AirTrack::sample_at`**：按时间求值并处理四种边界——越界不外推（两端保持）、单关键帧视为常量、`time` 为 `NaN` 退回首帧（`NaN` 参与比较会得到未定义摆位）、时间轴重复时不除零（取后一帧）。`linear` 走线性插值，`rotation` 走球面插值，`step` 保持前一帧。
+- **`AirTrack::interpolation`（`linear` / `step`）**：省略即 `linear`，老 AIR 文件反序列化时自动补齐，不需要迁移。`glTF` 的 `STEP` 采样器现在原样带进 AIR——它表达的是「保持」，降级成线性会把闪光/开关类动画抹平；`CUBICSPLINE` 的切线在提取阶段就已丢弃，仍按 `linear` 走，不假装支持三次插值。FBX 侧轨道由 ufbx 按帧烘焙，固定 `linear`。
+- **片段级接口**：`effective_duration`（`duration` 缺失或短于轨道末端时按末端兜底）、`wrap_time`（循环取模，负时间也能取到正确相位）、`apply_at`（把某时刻采样写回节点 TRS，旋转写回前归一化）、`keyframe_count` / `driven_node_count`（摘要与预算用）。
+- **`util::slerp_quat`**：最短路径球面插值。`q` 与 `-q` 表示同一旋转，按点积判号取反，否则会绕远路（180° 的插值会变成 260° 的回转）。
+- **导入期动画校验**：`validate` 分级报告动画问题。阻断级（`errors`）为属性名不是 `translation` / `rotation` / `scale`、轨道目标节点下标越界、时间点数与关键值数不等、时间轴非单调；提示级（`issues`）为片段无轨道、常量轨道、旋转关键帧未归一化、未知插值方式、`duration` 与轨道末端不符。这些错误此前全部静默通过，表现为「动画在面板里有名字，播出来不动」。
+- **`inspect_asset` 摘要的动画段**：每片段补出有效时长、关键帧数、被驱动节点数、`STEP` 轨道数——判断一段动画值不值得导，靠这几个数比看 `duration` 有用。
+- **单测 +13 条**：`air` 侧覆盖线性/端点/保持、`NaN`、`step`、单关键帧、球面插值与 `q`/`-q` 同解、重复时间戳、`duration` 兜底、`wrap_time` 负相位、`apply_at` 三通道写回与归一化、校验分级、`interpolation` 的序列化省略与反序列化补齐；`air_bin` 侧覆盖动画块经 `AIRB` 往返后采样值逐点一致；`gltf` 侧覆盖插值模式映射（`STEP` 保留、`CUBICSPLINE` 降级）。插件主 crate 57 条、视口 bin 50 条全绿。
+
+### 变更
+
+- `AirTrack` 新增字段 `interpolation`，`Default` 为空串（序列化时省略），构造处统一走 `crate::air::INTERPOLATION_LINEAR` / `INTERPOLATION_STEP` 常量，避免各处手写字符串。
+
+### 已知限制
+
+- 采样是逐轨道独立求值，不含骨骼层级与蒙皮：`apply_at` 只把 TRS 写到节点自身，父子叠加与 `skin` 权重留给第二刀（视口骨骼矩阵 + 蒙皮着色器）。
+- 只支持 `linear` / `step`。`CUBICSPLINE` 的切线在 AIR 里没有存放位置，降级是既定口径，不是待办。
+
 ## [0.4.0] - 2026-10-28
 
 本版把「面板里只有一棵描述树」补成了「能看见形状」：新增独立视口进程 `asset3d-gui.exe`，宿主按 `views[].external` 拉起它，两者以命名管道跑会话协议 `asset3d.session/1`；视口从「空窗口」一路做到网格 + 材质贴图 + 轨道相机 + 包围盒取景。`pluginApi` 升到 `1.1`（新增 `views` 与 `commands`），`AIRB` 仍为 `v1`——视口只消费既有 AIR 字段，不改格式。

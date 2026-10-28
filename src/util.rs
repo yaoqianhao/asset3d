@@ -296,6 +296,42 @@ pub fn normalize_quat(q: [f32; 4]) -> [f32; 4] {
     }
 }
 
+/// 四元数球面插值（最短路径），`t` 已由调用方夹在 `0..=1`。
+///
+/// 骨骼动画的关键帧旋转必须走 slerp：对四元数直接线性插值在夹角大时会让
+/// 中间帧的角速度明显变慢（nlerp 只是把结果投影回球面，误差仍在），
+/// 逐帧烘焙的 30fps 数据看不出来，旋转很快的动作就会「卡一下」。
+pub fn slerp_quat(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let a = normalize_quat(a);
+    let mut b = normalize_quat(b);
+    let mut dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    // q 与 -q 表示同一旋转，取夹角较小的那半边，否则会绕远路转一整圈。
+    if dot < 0.0 {
+        b = [-b[0], -b[1], -b[2], -b[3]];
+        dot = -dot;
+    }
+    dot = dot.min(1.0);
+    // 夹角极小（sin θ ≈ 0）时 slerp 退化为 0/0，直接线性插值再归一化。
+    if dot > 0.9995 {
+        return normalize_quat([
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+            a[3] + (b[3] - a[3]) * t,
+        ]);
+    }
+    let theta = dot.acos();
+    let sin_theta = theta.sin();
+    let wa = ((1.0 - t) * theta).sin() / sin_theta;
+    let wb = (t * theta).sin() / sin_theta;
+    [
+        a[0] * wa + b[0] * wb,
+        a[1] * wa + b[1] * wb,
+        a[2] * wa + b[2] * wb,
+        a[3] * wa + b[3] * wb,
+    ]
+}
+
 /// 从列主序 4x4 里取平移/旋转（转四元数）/缩放，用于填充节点 TRS。
 pub fn decompose(m: &[f32; 16]) -> ([f32; 3], [f32; 4], [f32; 3]) {
     let translation = [m[12], m[13], m[14]];

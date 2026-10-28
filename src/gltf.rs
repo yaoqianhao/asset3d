@@ -1154,6 +1154,18 @@ fn read_mat4(g: &Gltf<'_>, buffers: &[Vec<u8>], accessor_index: u64) -> Result<V
     Ok(out)
 }
 
+/// glTF 的采样器插值模式 → AIR 轨道插值模式。
+///
+/// 只认 STEP 与 LINEAR 两种：CUBICSPLINE 的切线在提取阶段已丢弃，保留字面量只会
+/// 让播放端以为能做三次插值；大小写不敏感是因为不同导出器写法不统一。
+fn air_interpolation(raw: &str) -> &'static str {
+    if raw.eq_ignore_ascii_case("step") {
+        crate::air::INTERPOLATION_STEP
+    } else {
+        crate::air::INTERPOLATION_LINEAR
+    }
+}
+
 fn extract_animations(doc: &mut AirDoc, g: &Gltf<'_>, buffers: &[Vec<u8>]) {
     for (anim_index, animation) in g.array("animations").iter().enumerate() {
         let name = animation
@@ -1258,6 +1270,9 @@ fn extract_animations(doc: &mut AirDoc, g: &Gltf<'_>, buffers: &[Vec<u8>]) {
             clip.tracks.push(AirTrack {
                 node: node as u32,
                 property,
+                // STEP 的语义是「保持前一帧」，必须原样带进 AIR；CUBICSPLINE 的切线
+                // 上面已丢弃，只能降级成 linear。
+                interpolation: air_interpolation(interpolation).to_string(),
                 times,
                 values: values_out,
             });
@@ -1272,6 +1287,19 @@ fn extract_animations(doc: &mut AirDoc, g: &Gltf<'_>, buffers: &[Vec<u8>]) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn interpolation_mapping_only_keeps_step() {
+        assert_eq!(air_interpolation("STEP"), crate::air::INTERPOLATION_STEP);
+        assert_eq!(air_interpolation("step"), crate::air::INTERPOLATION_STEP);
+        assert_eq!(air_interpolation("LINEAR"), crate::air::INTERPOLATION_LINEAR);
+        // CUBICSPLINE 的切线已丢弃，必须降级，绝不能把名字原样带出去。
+        assert_eq!(
+            air_interpolation("CUBICSPLINE"),
+            crate::air::INTERPOLATION_LINEAR
+        );
+        assert_eq!(air_interpolation("随便写的"), crate::air::INTERPOLATION_LINEAR);
+    }
 
     /// 造一个最小的 float VEC3 accessor 文档，`buffers` 只放一份 12 字节数据。
     fn doc_with_accessor(accessor: Value) -> Value {
