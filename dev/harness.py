@@ -1,12 +1,19 @@
 """asset3d 插件的宿主侧联调台：按 NDJSON 帧协议驱动 dist/asset3d.exe。
 
 为什么自己写：宿主真实的插件通道在 Electron 主进程里，跑一次要开 IDE；
-这个脚本只实现插件用到的 6 个 host/* 方法，外加**真实的 1 MiB 单帧上限**，
-让「帧预算」这类问题在本地就能撞出来，而不是等上线被 6106 杀掉进程。
+这个脚本只实现插件用到的 6 个 host/* 方法，但**照抄宿主的硬约束**，让问题在本地
+就撞出来，而不是等上线被杀进程：
+
+- 单帧 1 MiB（`crates/plugin/src/loader.rs: FRAME_LIMIT_BYTES`）
+- `host/fs.read` 单次读窗口 512 KiB，靠 `offset` 续读，回包带 `offset`/`size`/`eof`
+  （`crates/core/src/plugin_host.rs: MAX_READ_WINDOW_BYTES`）
+- `host/fs.write` 支持 `append` / `offset`，分片写的回包带写后 `size`
+- 单次工具调用最多 200 次宿主调用，超了回 6109（`QUOTA_PER_CALL`）
 
 用法：
-    python dev/harness.py            # 跑默认用例
-    python dev/harness.py --big      # 额外验证「超大资产」的拒绝路径
+    python dev/harness.py            # 分片读写宿主（0.3.0 的目标环境）
+    python dev/harness.py --legacy   # 模拟 0.2.0 时代的旧宿主：fs.read 无 offset、
+                                     # fs.write 无 append/offset、回包没有 size/eof
 """
 
 from __future__ import annotations
@@ -24,12 +31,29 @@ WS = ROOT / ".tmp-ws"
 FRAME_LIMIT = 1024 * 1024
 # 单帧留给路径/字段名/编码的固定余量，与 src/rpc.rs 的 FRAME_RESERVE_BYTES 一致
 SHARD_RESERVE = 64 * 1024
+# 与宿主 MAX_READ_WINDOW_BYTES / QUOTA_PER_CALL 对齐
+MAX_READ_WINDOW = 512 * 1024
+QUOTA_PER_CALL = 200
 SENSITIVE = {".env", ".git", ".ssh", "id_rsa"}
+# 0.2.0 的单帧读取上限：1 MiB 帧按 base64 4:3 回推
+LEGACY_READ_BYTES = (FRAME_LIMIT - SHARD_RESERVE) // 4 * 3
+
+
+class HostApiError(Exception):
+    """带宿主错误码的失败：插件靠 code + message 判断「旧宿主不支持 offset」。"""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class Harness:
-    def __init__(self, exe: Path, workspace: Path) -> None:
+    def __init__(self, exe: Path, workspace: Path, legacy: bool = False) -> None:
         self.workspace = workspace.resolve()
+        self.legacy = legacy
+        self.calls_used = 0
+        self.max_calls_seen = 0
         self.proc = subprocess.Popen(
             [str(exe)],
             cwd=str(exe.parent),
@@ -46,6 +70,8 @@ class Harness:
         self.progress: list[str] = []
         self.violations: list[str] = []
         self.writes: list[str] = []
+        # 记下每次 fs.read 的分片边界：验证「真的分片读了」而不是碰巧一次读完
+        self.reads: list[tuple[str, int, int]] = []
         threading.Thread(target=self._pump_stdout, daemon=True).start()
         threading.Thread(target=self._pump_stderr, daemon=True).start()
 
@@ -59,6 +85,7 @@ class Harness:
 
     def _pump_stdout(self) -> None:
         for raw in self.proc.stdout:
+            # 宿主按行读帧，超过 1 MiB 直接判协议违规：这里如实记下来
             if len(raw.encode("utf-8")) > FRAME_LIMIT:
                 self.violations.append(f"插件回包超限 {len(raw)} 字节")
                 self.proc.kill()
@@ -73,6 +100,14 @@ class Harness:
                 try:
                     result = self._host_call(frame["method"], frame.get("params") or {})
                     self._send({"jsonrpc": "2.0", "id": frame.get("id"), "result": result})
+                except HostApiError as exc:
+                    self._send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": frame.get("id"),
+                            "error": {"code": exc.code, "message": exc.message},
+                        }
+                    )
                 except Exception as exc:  # noqa: BLE001 - 联调台，错误要原样回给插件
                     self._send(
                         {
@@ -89,10 +124,13 @@ class Harness:
         for raw in self.proc.stderr:
             print(f"  [plugin] {raw.rstrip()}")
 
-    def request(self, method: str, params: dict, timeout: float = 120.0) -> dict:
+    def request(self, method: str, params: dict, timeout: float = 180.0) -> dict:
         with self.lock:
             self.next_id += 1
             rid = self.next_id
+            # 宿主在每次工具调用开始时把配额计数归零（begin_call）
+            if method == "plugin/tool-invoke":
+                self.calls_used = 0
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         waited = 0.0
         step = 0.05
@@ -114,6 +152,13 @@ class Harness:
         return target
 
     def _host_call(self, method: str, params: dict):
+        with self.lock:
+            if self.calls_used >= QUOTA_PER_CALL:
+                raise HostApiError(
+                    6109, f"单次工具调用的宿主调用次数已达上限（{QUOTA_PER_CALL} 次）"
+                )
+            self.calls_used += 1
+            self.max_calls_seen = max(self.max_calls_seen, self.calls_used)
         if method == "host/progress":
             self.progress.append(params.get("message", ""))
             return {"ok": True}
@@ -134,34 +179,87 @@ class Harness:
                 )
             return {"entries": entries}
         if method == "host/fs.read":
-            target = self._abs(rel)
-            encoding = params.get("encoding", "utf8")
-            max_bytes = int(params.get("maxBytes") or 96 * 1024 * 1024)
-            raw = target.read_bytes()
-            keep = raw[:max_bytes]
-            content = (
-                base64_encode(keep) if encoding == "base64" else keep.decode("utf-8", "replace")
-            )
-            return {
-                "path": rel,
-                "content": content,
-                "encoding": encoding,
-                "bytes": len(keep),
-                "truncated": len(raw) > max_bytes,
-            }
+            return self._fs_read(rel, params)
         if method == "host/fs.write":
-            target = self._abs(rel)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            created = not target.exists()
-            if params.get("encoding") == "base64":
-                import base64
-
-                target.write_bytes(base64.b64decode(params["content"]))
-            else:
-                target.write_text(params["content"], encoding="utf-8")
-            self.writes.append(rel)
-            return {"path": rel, "created": created, "bytes": target.stat().st_size}
+            return self._fs_write(rel, params)
         raise NotImplementedError(method)
+
+    def _fs_read(self, rel: str, params: dict) -> dict:
+        # 旧宿主：参数表里没有 offset，多传就是「未知参数」
+        if self.legacy and "offset" in params:
+            raise HostApiError(-32602, "host/fs.read: unknown parameter `offset`")
+        target = self._abs(rel)
+        encoding = params.get("encoding", "utf8")
+        raw = target.read_bytes()
+        size = len(raw)
+        offset = int(params.get("offset") or 0)
+        if offset > size:
+            raise HostApiError(1003, f"offset {offset} 超出文件长度 {size}：{rel}")
+        want = int(params.get("maxBytes") or (size or 1))
+        if not self.legacy:
+            # 关键：宿主会把 maxBytes 夹到 512 KiB，插件必须按回包 bytes 推进
+            want = min(want, MAX_READ_WINDOW)
+        chunk = raw[offset : offset + want]
+        content = (
+            base64_encode(chunk) if encoding == "base64" else chunk.decode("utf-8", "replace")
+        )
+        self.reads.append((rel, offset, len(chunk)))
+        reply = {
+            "path": rel,
+            "content": content,
+            "encoding": encoding,
+            "bytes": len(chunk),
+            "truncated": offset + len(chunk) < size,
+        }
+        if not self.legacy:
+            reply.update(
+                {"offset": offset, "size": size, "eof": offset + len(chunk) >= size}
+            )
+        return reply
+
+    def _fs_write(self, rel: str, params: dict) -> dict:
+        if self.legacy and ("append" in params or "offset" in params):
+            raise HostApiError(
+                -32602, "host/fs.write: unknown parameter `append` / `offset`"
+            )
+        target = self._abs(rel)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existed = target.exists()
+        data = (
+            __import__("base64").b64decode(params["content"])
+            if params.get("encoding") == "base64"
+            else str(params.get("content", "")).encode("utf-8")
+        )
+        before = target.stat().st_size if existed else 0
+        append = bool(params.get("append"))
+        at = params.get("offset")
+        if append:
+            start = before
+        elif at is not None:
+            start = int(at)
+        else:
+            start = None
+
+        if start is None:
+            # 缺省语义：整文件替换（宿主走临时文件 + rename，这里等价写字节）
+            target.write_bytes(data)
+            offset, size, padded = 0, len(data), 0
+        else:
+            padded = max(0, start - before)
+            mode = "r+b" if existed else "w+b"
+            with open(target, mode) as fh:
+                if padded:
+                    fh.truncate(start)  # 与宿主 set_len 补零一致
+                fh.seek(start)
+                fh.write(data)
+                fh.flush()
+            offset, size = start, max(start + len(data), before)
+        self.writes.append(rel)
+        reply = {"path": rel, "created": not existed, "bytes": len(data)}
+        if not self.legacy:
+            # 旧宿主回包没有 size：插件靠它判断「append 是否真的生效」
+            reply.update({"offset": offset, "size": size, "padded": padded})
+        return reply
 
     # ---- 用例 -------------------------------------------------------------
     def hello(self) -> dict:
@@ -220,12 +318,27 @@ def summarise(air: dict) -> dict:
     }
 
 
-def main() -> int:
+def glb_image_bytes(path: Path) -> bytes:
+    """从 GLB 里取出 image 的原始字节：用来验证分片读写没有悄悄改动内容。"""
+    blob = path.read_bytes()
+    total = int.from_bytes(blob[8:12], "little")
+    assert total == len(blob), f"{path} 的 GLB 长度字段对不上"
+    json_len = int.from_bytes(blob[12:16], "little")
+    doc = json.loads(blob[20 : 20 + json_len].decode("utf-8"))
+    bin_start = 20 + json_len + 8
+    binary = blob[bin_start:]
+    view = doc["bufferViews"][doc["images"][0]["bufferView"]]
+    start = view.get("byteOffset", 0)
+    return binary[start : start + view["byteLength"]]
+
+
+def prepare_fixtures() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import make_big_fixture
     import make_fbx_fixture
     import make_fixture
     import make_glb_fixture
+    import make_huge_fixture
     import make_skin_fixture
 
     make_fixture.main()
@@ -238,13 +351,12 @@ def main() -> int:
     make_skin_fixture.main()
     # 大夹具（26450 三角形）必须先于断言生成：预览分片是本次要盯的核心。
     make_big_fixture.main()
+    # 超大夹具（1.04 MiB / 2.87 MiB）：0.2.0 的 720 KiB 上限正好卡在它们之间。
+    make_huge_fixture.main()
 
-    if not EXE.exists():
-        print(f"缺少 {EXE}，先跑 cargo build --release 并复制到 dist/")
-        return 2
 
+def run_paged(failures: list[str]) -> None:
     harness = Harness(EXE, WS)
-    failures: list[str] = []
     try:
         hello = harness.hello()
         plugin = hello.get("result") or {}
@@ -415,28 +527,231 @@ def main() -> int:
                     f"单片最大 {biggest} < {FRAME_LIMIT - SHARD_RESERVE}"
                 )
 
-        # 预算保护：写一个必然超帧的文件，要求插件给出「宿主原语不支持分片」而不是被杀
-        big = WS / "big.bin"
-        big.write_bytes(b"\x00" * (2 * 1024 * 1024))
-        ok, text = harness.tool("preview_asset", {"path": "big.bin"})
-        print(f"[info] 超限路径：{text.splitlines()[0][:150]}")
+        run_huge(harness, failures)
+
+        # 越界保护：超过 96 MiB 的资产要在插件侧拦下，并给出可操作诊断，
+        # 而不是把 200 次宿主调用额度刷爆后由宿主判违规终止进程。
+        over = WS / "over_limit.bin"
+        with open(over, "wb") as fh:
+            fh.truncate(97 * 1024 * 1024)
+        ok, text = harness.tool("inspect_asset", {"path": "over_limit.bin"})
+        print(f"[{'ok  ' if not ok else 'fail'}] 97 MiB 资产被插件拦下：{text.splitlines()[0][:120]}")
+        if ok:
+            failures.append("97 MiB 资产没有被拦截")
+        elif "超过单次导入上限" not in text:
+            failures.append(f"超限诊断缺少可操作说明：{text[:200]}")
 
         if harness.violations:
             failures.extend(harness.violations)
         else:
             print(f"[ok  ] 全程无超限帧（上限 {FRAME_LIMIT} 字节）")
-        print(f"[info] 进度日志 {len(harness.progress)} 条，写盘 {len(harness.writes)} 次")
+        print(
+            f"[info] 分片读宿主：进度 {len(harness.progress)} 条，写盘 {len(harness.writes)} 次，"
+            f"单次工具调用最多用了 {harness.max_calls_seen} / {QUOTA_PER_CALL} 次宿主调用"
+        )
     finally:
         harness.close()
 
+
+def run_huge(harness: Harness, failures: list[str]) -> None:
+    """超过旧上限（720 KiB）与超过 2 MiB 两个量级的端到端验证。
+
+    关注点不是「能跑通」，而是三件具体的事：
+    1. 读：真的按 offset 分片读（每片 ≤ 512 KiB），没有靠放大帧蒙混；
+    2. 写：超过 1 MiB 的 AIR JSON / 预览载荷被分片写下去，且内容逐字节没变；
+    3. 上限：96 MiB 之内的资产不会被宿主判违规，也不会被插件提前吓退。
+    """
+    for stem, floor in (("huge_1m", 720 * 1024), ("huge_3m", 2 * 1024 * 1024)):
+        source = WS / f"{stem}.glb"
+        size = source.stat().st_size
+        if size <= floor:
+            failures.append(f"{source.name} 只有 {size} 字节，没超过 {floor}，测不到目标场景")
+            continue
+
+        before_reads = len(harness.reads)
+        ok, text = harness.tool("inspect_asset", {"path": source.name})
+        reads = [item for item in harness.reads[before_reads:] if item[0] == source.name]
+        chunks = [item[2] for item in reads]
+        head = text.splitlines()[0] if text else ""
+        print(
+            f"[{'ok  ' if ok else 'fail'}] inspect_asset ({source.name} {size} 字节): "
+            f"读 {len(reads)} 片，最大 {max(chunks) if chunks else 0} 字节 | {head[:80]}"
+        )
+        if not ok:
+            failures.append(f"inspect_asset ({source.name}) -> {text}")
+            continue
+        if len(reads) < 2:
+            failures.append(f"{source.name} 超过 720 KiB 却只读了 {len(reads)} 次，没有走分片")
+        if chunks and max(chunks) > MAX_READ_WINDOW:
+            failures.append(f"{source.name} 单片 {max(chunks)} 超过宿主窗口 {MAX_READ_WINDOW}")
+        if sum(chunks) != size:
+            failures.append(f"{source.name} 分片合计 {sum(chunks)} 与文件长度 {size} 不符")
+
+        # 导出必须内嵌贴图，否则 AIR 只有几百 KB，写侧的分片路径根本不会触发
+        # out 会被规范成 .air.json / .air.bin：显式给出 .air.json 才能落到可预期的文件名
+        out_base = f"{stem}_embed.air.json"
+        ok, text = harness.tool(
+            "export_asset",
+            {
+                "path": source.name,
+                "format": "both",
+                "embedTextures": True,
+                "out": out_base,
+            },
+        )
+        head = text.splitlines()[0] if text else ""
+        print(f"[{'ok  ' if ok else 'fail'}] export_asset ({source.name}): {head[:110]}")
+        if not ok:
+            failures.append(f"export_asset ({source.name}) -> {text}")
+            continue
+
+        json_path = WS / out_base
+        bin_path = WS / out_base.replace(".air.json", ".air.bin")
+        if not json_path.exists() or not bin_path.exists():
+            failures.append(f"{source.name} 导出缺文件：{json_path.name} / {bin_path.name}")
+            continue
+        json_size = json_path.stat().st_size
+        bin_size = bin_path.stat().st_size
+        if json_size <= FRAME_LIMIT:
+            failures.append(
+                f"{json_path.name} 只有 {json_size} 字节，没超过单帧 1 MiB，写侧分片没被测到"
+            )
+        if bin_path.read_bytes()[:4] != b"AIRB":
+            failures.append(f"{bin_path.name} magic 不是 AIRB")
+
+        # 逐字节核对贴图：分片读 + 分片写都可能悄悄截断，只有比对哈希能发现
+        import hashlib
+
+        expected = hashlib.sha256(glb_image_bytes(source)).hexdigest()
+        air = json.loads(json_path.read_text(encoding="utf-8"))
+        textures = air.get("textures") or []
+        payload = textures[0].get("data_base64") if textures else None
+        if not payload:
+            failures.append(f"{json_path.name} 里贴图没内嵌")
+        else:
+            got = hashlib.sha256(__import__("base64").b64decode(payload)).hexdigest()
+            if got != expected:
+                failures.append(f"{source.name} 贴图哈希不一致：{got[:16]} != {expected[:16]}")
+            else:
+                print(
+                    f"[ok  ] {source.name} 贴图逐字节一致（sha256 {got[:16]}…），"
+                    f".air.json {json_size} 字节 / .air.bin {bin_size} 字节"
+                )
+
+        # 预览：贴图内嵌 + HTML 分片，必须多片且每片都在预算内
+        out_html = f"{stem}.preview.html"
+        before_writes = len(harness.writes)
+        ok, text = harness.tool(
+            "preview_asset", {"path": source.name, "out": out_html}
+        )
+        head = text.splitlines()[0] if text else ""
+        print(f"[{'ok  ' if ok else 'fail'}] preview_asset ({source.name}): {head[:110]}")
+        if not ok:
+            failures.append(f"preview_asset ({source.name}) -> {text}")
+            continue
+        shards = sorted(WS.glob(f"{stem}.preview.shard.*.js"))
+        sizes = [item.stat().st_size for item in shards]
+        total = sum(sizes)
+        biggest = max(sizes) if sizes else 0
+        if not shards:
+            failures.append(f"{source.name} 预览没有产出分片")
+        elif biggest >= FRAME_LIMIT - SHARD_RESERVE:
+            failures.append(f"{source.name} 预览单片 {biggest} 超出预算 {FRAME_LIMIT - SHARD_RESERVE}")
+        elif total <= FRAME_LIMIT:
+            failures.append(f"{source.name} 预览载荷 {total} 没超过 1 MiB，分片路径没覆盖")
+        else:
+            print(
+                f"[ok  ] {source.name} 预览 {len(shards)} 片共 {total} 字节，单片最大 {biggest}"
+                f"（写盘 {len(harness.writes) - before_writes} 次）"
+            )
+        if not (WS / out_html).exists():
+            failures.append(f"{source.name} 预览缺 HTML 骨架")
+
+
+def run_legacy(failures: list[str]) -> None:
+    """旧宿主回归：不能因为新能力就要求所有人先升级宿主。
+
+    分片能力缺失时必须退回整文件路径；只有「整文件也装不下」的资产才报错，
+    而且报错要直接说清「宿主太旧 + 上限是多少 + 该怎么办」。
+    """
+    harness = Harness(EXE, WS, legacy=True)
+    try:
+        ok = harness.hello().get("result") is not None
+        if not ok:
+            failures.append("旧宿主下握手失败")
+            return
+
+        for name, args in [
+            ("inspect_asset", {"path": "cube.gltf"}),
+            ("preview_asset", {"path": "cube.gltf"}),
+            ("inspect_asset", {"path": "big.glb"}),
+        ]:
+            ok, text = harness.tool(name, args)
+            print(f"[{'ok  ' if ok else 'fail'}] 旧宿主 {name}: {text.splitlines()[0][:110]}")
+            if not ok:
+                failures.append(f"旧宿主 {name} 不该失败 -> {text}")
+
+        # 590 KB 的 big.glb 超过 512 KiB 窗口，旧宿主只能整帧读；它仍应成功，
+        # 这正是「降级而不是拒绝服务」的证据。
+        big = WS / "big.glb"
+        if big.stat().st_size > LEGACY_READ_BYTES:
+            failures.append("big.glb 已超过旧宿主上限，无法作为降级成功用例")
+
+        ok, text = harness.tool("inspect_asset", {"path": "huge_3m.glb"})
+        print(f"[{'ok  ' if not ok else 'fail'}] 旧宿主读 2.87 MiB 资产被拦：{text.splitlines()[0][:120]}")
+        if ok:
+            failures.append("旧宿主竟然读成功了大资产，说明没走 is_unsupported 判定")
+        elif "宿主版本过旧" not in text or "host/fs.read" not in text:
+            failures.append(f"大资产在旧宿主上的诊断不可操作：{text[:200]}")
+
+        # 写侧降级：导出内嵌贴图的 AIR 必然超帧，旧宿主不支持 append 就该失败，
+        # 而且不能留下半截文件（0 字节文件也算「写了」，会误导后续读取）。
+        target = WS / "legacy_big.air.json"
+        ok, text = harness.tool(
+            "export_asset",
+            {"path": "big.glb", "format": "json", "embedTextures": True, "out": "legacy_big"},
+        )
+        print(f"[{'ok  ' if not ok else 'fail'}] 旧宿主分片写被拦：{text.splitlines()[0][:120]}")
+        if ok:
+            failures.append("旧宿主不支持 append 却导出成功，分片写降级逻辑有问题")
+        elif "宿主版本过旧" not in text or "host/fs.write" not in text:
+            failures.append(f"分片写在旧宿主上的诊断不可操作：{text[:200]}")
+        if target.exists() and target.stat().st_size > 0:
+            failures.append(f"分片写失败后留下了半截文件：{target.name} {target.stat().st_size} 字节")
+        else:
+            print("[ok  ] 分片写失败未留下半截文件")
+
+        if harness.violations:
+            failures.extend(harness.violations)
+    finally:
+        harness.close()
+
+
+def main() -> int:
+    if not EXE.exists():
+        print(f"缺少 {EXE}，先跑 cargo build --release 并把产物复制到 dist/")
+        return 2
+    WS.mkdir(parents=True, exist_ok=True)
+    prepare_fixtures()
+    print(f"[info] 宿主模式：{'旧宿主（无 offset/append）' if LEGACY_ONLY else '分片读写'}")
+
+    failures: list[str] = []
+    if LEGACY_ONLY:
+        run_legacy(failures)
+    else:
+        run_paged(failures)
+        run_legacy(failures)
+
+    print()
     if failures:
-        print("\n失败项：")
+        print(f"FAILED {len(failures)} 项：")
         for item in failures:
-            print(f" - {item}")
+            print(f"  - {item}")
         return 1
-    print("\n全部用例通过")
+    print("全部通过")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    LEGACY_ONLY = "--legacy" in sys.argv
+    sys.exit(main())

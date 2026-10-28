@@ -158,6 +158,9 @@ fn run_tool(host: &Host, params: &Value) -> Result<Value, (i64, String)> {
     // 宿主可能传全名 `plugin__asset3d__inspect_asset`（注册表口径），也可能传
     // 裸名（握手顺序）。两种都收，剥掉命名空间即可。
     let tool = raw_tool.rsplit("__").next().unwrap_or(&raw_tool).to_string();
+    // 宿主的 200 次调用配额是「按工具调用」重置的（`begin_call`），插件这边的
+    // 计数器必须同步归零，否则第二次工具调用一开始就以为自己没额度了。
+    host.reset_call_quota();
     let args = params
         .get("arguments")
         .cloned()
