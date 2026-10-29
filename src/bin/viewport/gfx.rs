@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
+use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 use winit::dpi::PhysicalSize;
@@ -42,6 +43,23 @@ const SHADER: &str = include_str!("shader.wgsl");
 
 /// 参考地板（地面网格 + 坐标轴）的着色器：不参与光照，顶点色直出。
 const GRID_SHADER: &str = include_str!("grid.wgsl");
+
+/// 屏幕空间覆盖层（时间轴）：顶点即裁剪空间坐标，不做光照。
+const OVERLAY_SHADER: &str = include_str!("overlay.wgsl");
+
+/// 骨骼线框的颜色：父端偏深、子端偏亮，一条线自带方向感。
+const BONE_COLOR_FROM: [f32; 3] = [1.0, 0.52, 0.16];
+const BONE_COLOR_TO: [f32; 3] = [1.0, 0.82, 0.45];
+
+/// 时间轴的几何（裁剪空间）：底部一条细长槽，进度从左往右填。
+const TIMELINE_Y0: f32 = -0.975;
+const TIMELINE_Y1: f32 = -0.925;
+const TIMELINE_X0: f32 = -0.92;
+const TIMELINE_X1: f32 = 0.92;
+/// 两个矩形 = 12 个顶点，槽 6 个 + 进度 6 个。
+const TIMELINE_VERTICES: usize = 12;
+const TIMELINE_TRACK_COLOR: [f32; 3] = [0.06, 0.07, 0.09];
+const TIMELINE_FILL_COLOR: [f32; 3] = [1.0, 0.62, 0.24];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -93,6 +111,25 @@ struct GpuScene {
     /// 避免「绑定还在、缓冲先被回收」这类只在特定后端出现的时序问题。
     #[allow(dead_code)]
     bone_buffer: wgpu::Buffer,
+    /// 矩阵槽位容量：`update_bones` 写之前必须核对，越界写会被 wgpu 校验层拦住
+    /// （发布版则是未定义行为）。
+    bone_capacity: usize,
+}
+
+/// 骨骼线框：一条 LineList 顶点缓冲。线的**拓扑**（哪两根骨头相连）在载入时
+/// 定死，每帧只改端点位置——关节数不会变，缓冲因此可以复用，不必每帧重建。
+struct SkeletonLines {
+    buffer: wgpu::Buffer,
+    /// 每根线两端在矩阵表里的槽位。
+    lines: Vec<[u16; 2]>,
+    /// 顶点容量（= lines.len() × 2）。
+    capacity: usize,
+}
+
+/// 底部时间轴：槽 + 进度两段矩形，顶点全是裁剪空间坐标。
+struct Timeline {
+    buffer: wgpu::Buffer,
+    visible: bool,
 }
 
 /// 渲染器。`surface` 用 `'static`：持有一份 `Arc<Window>` 的克隆，
@@ -115,10 +152,9 @@ pub struct Gfx {
     sampler: wgpu::Sampler,
     /// 默认材质的 bind group：场景没有分区（或分区不完整）时直接用它。
     fallback_bind: wgpu::BindGroup,
-    /// 骨骼绑定（group 2）的布局，以及「一份恒等矩阵」的兜底绑定：
-    /// 管线要求 group 2 必须绑上，静态资产也得占个位。
+    /// 骨骼绑定（group 2）的布局。管线要求 group 2 必须绑上，所以每个场景
+    /// 都自带一份绑定（静态资产放一份恒等矩阵），不留「可选绑定」的分支。
     bone_layout: wgpu::BindGroupLayout,
-    fallback_bones: wgpu::BindGroup,
     depth: Option<wgpu::TextureView>,
     scene: Option<GpuScene>,
     /// 参考地板：常驻的一条线段缓冲。没有模型的空窗口靠它证明「视口活着」，
@@ -126,6 +162,14 @@ pub struct Gfx {
     grid_pipeline: wgpu::RenderPipeline,
     grid_vertices: wgpu::Buffer,
     grid_vertex_count: u32,
+    /// 骨骼线框管线：与地板共用着色器，但**忽略深度**（Always）——骨架被模型
+    /// 包在身体里，不穿透就永远看不见，那这个功能等于没做。
+    skeleton_pipeline: wgpu::RenderPipeline,
+    skeleton: Option<SkeletonLines>,
+    skeleton_visible: bool,
+    /// 时间轴覆盖层管线与常驻缓冲。
+    timeline_pipeline: wgpu::RenderPipeline,
+    timeline: Timeline,
 }
 
 impl Gfx {
@@ -310,27 +354,6 @@ impl Gfx {
                 count: None,
             }],
         });
-        let fallback_bones = {
-            // 一份恒等矩阵：静态资产权重全零、根本不会读它，但 group 2 必须绑上，
-            // 否则管线校验直接失败。
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("asset3d-viewport-fallback-bones"),
-                contents: bytemuck::cast_slice(&[[
-                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-                    1.0f32,
-                ]]),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("asset3d-viewport-fallback-bones-bind"),
-                layout: &bone_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
-            })
-        };
-
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("asset3d-viewport-pipeline-layout"),
             bind_group_layouts: &[&bind_group_layout, &material_layout, &bone_layout],
@@ -481,6 +504,134 @@ impl Gfx {
             cache: None,
         });
 
+        // ---- 骨骼线框 ----
+        // 与地板同一套顶点布局/着色器，唯一差别是深度比较用 `Always`：骨架在
+        // 蒙皮网格内部，按深度走会被人体整个挡住（那就白做了）。
+        let skeleton_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("asset3d-viewport-skeleton-pipeline"),
+            layout: Some(&grid_layout),
+            vertex: wgpu::VertexState {
+                module: &grid_shader,
+                entry_point: "vs_grid",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GridVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &grid_shader,
+                entry_point: "fs_grid",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                // 不写深度：骨架是「叠加显示」的辅助线，不该参与遮挡关系。
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // ---- 时间轴覆盖层 ----
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("asset3d-viewport-overlay-shader"),
+            source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER.into()),
+        });
+        // 覆盖层不读任何绑定：空 layout，省掉每帧为它绑 group 0。
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("asset3d-viewport-overlay-layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let timeline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("asset3d-viewport-timeline-pipeline"),
+            layout: Some(&overlay_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: "vs_overlay",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GridVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        // 位置 z 复用成透明度（见 overlay.wgsl）。
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: "fs_overlay",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // 槽是半透明的：压在模型上也不该像贴了一块黑板。
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            // 覆盖层完全不参与深度：它永远在最后一层画。
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let timeline_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("asset3d-viewport-timeline"),
+            size: (TIMELINE_VERTICES * std::mem::size_of::<GridVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let grid = reference_grid();
         // 场景侧的顶点是 32 字节的 `Vertex`（带 UV），地板只留位置 + 颜色。
         let packed: Vec<GridVertex> = grid
@@ -514,12 +665,19 @@ impl Gfx {
             sampler,
             fallback_bind,
             bone_layout,
-            fallback_bones,
             depth: Some(depth),
             scene: None,
             grid_pipeline,
             grid_vertices,
             grid_vertex_count,
+            skeleton_pipeline,
+            skeleton: None,
+            skeleton_visible: false,
+            timeline_pipeline,
+            timeline: Timeline {
+                buffer: timeline_buffer,
+                visible: false,
+            },
         })
     }
 
@@ -545,6 +703,8 @@ impl Gfx {
 
         // ---- 蒙皮矩阵：一张平铺的 storage buffer ----
         // 没有蒙皮资产时也建一份（1 个恒等矩阵），省掉渲染路径里的 Option 分支。
+        // 加 `COPY_DST`：第三刀起这张表每帧随动画改写（`update_bones`）。
+        let bone_matrix_count = scene.joint_matrices.len().max(1);
         let bone_buffer = {
             let contents: Vec<[f32; 16]> = if scene.joint_matrices.is_empty() {
                 vec![[
@@ -558,7 +718,7 @@ impl Gfx {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("asset3d-viewport-bones"),
                     contents: bytemuck::cast_slice(&contents),
-                    usage: wgpu::BufferUsages::STORAGE,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 })
         };
         let bones = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -643,11 +803,103 @@ impl Gfx {
             // 「绑定还在、缓冲先被回收」这种只在特定后端出现的时序问题。
             material_uniforms,
             bone_buffer,
+            bone_capacity: bone_matrix_count,
         });
+        // 换资产时骨架必须跟着换：旧线框图连的是旧槽位，留着就是把新模型的
+        // 关节按旧拓扑连起来——画面上会出现一根不知所云的斜线。
+        self.skeleton = None;
+        self.timeline.visible = false;
     }
 
     pub fn clear_scene(&mut self) {
         self.scene = None;
+        self.skeleton = None;
+        self.timeline.visible = false;
+    }
+
+    /// 上传骨架拓扑与当前姿态的关节位置。
+    ///
+    /// 线框关着也照样建缓冲：`B` 键要能立刻显示，不该等到「下一次载入资产」才
+    /// 有数据。拓扑（哪两根骨头相连）此后固定，每帧只改端点位置。
+    pub fn set_skeleton(&mut self, lines: &[[u16; 2]], points: &[Vec3]) {
+        if lines.is_empty() || points.is_empty() {
+            self.skeleton = None;
+            return;
+        }
+        let vertices = skeleton_vertices(lines, points);
+        let capacity = vertices.len();
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("asset3d-viewport-skeleton"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        self.skeleton = Some(SkeletonLines {
+            buffer,
+            lines: lines.to_vec(),
+            capacity,
+        });
+    }
+
+    pub fn set_skeleton_visible(&mut self, visible: bool) {
+        self.skeleton_visible = visible;
+    }
+
+    /// 每帧改写蒙皮矩阵。长度必须先核对：`bone_capacity` 是建缓冲时的槽位数，
+    /// 越界写会被校验层拦住（发布版则是未定义行为）。
+    pub fn update_bones(&mut self, matrices: &[[f32; 16]]) {
+        let Some(scene) = &self.scene else {
+            return;
+        };
+        if matrices.is_empty() || matrices.len() > scene.bone_capacity {
+            return;
+        }
+        self.queue
+            .write_buffer(&scene.bone_buffer, 0, bytemuck::cast_slice(matrices));
+    }
+
+    /// 每帧改写骨骼端点。槽位越界的线退化成一个点（画不出来），不会顺延错位。
+    pub fn update_skeleton(&mut self, points: &[Vec3]) {
+        let Some(skeleton) = &mut self.skeleton else {
+            return;
+        };
+        let vertices = skeleton_vertices(&skeleton.lines, points);
+        if vertices.len() != skeleton.capacity {
+            return;
+        }
+        self.queue
+            .write_buffer(&skeleton.buffer, 0, bytemuck::cast_slice(&vertices));
+    }
+
+    /// 时间轴：`None` 隐藏（没有动画的资产不该出现一条永远 0% 的进度条），
+    /// `Some(p)` 按 0..1 填进度。
+    pub fn set_timeline(&mut self, progress: Option<f32>) {
+        let Some(progress) = progress.filter(|progress| progress.is_finite()) else {
+            self.timeline.visible = false;
+            return;
+        };
+        let progress = progress.clamp(0.0, 1.0);
+        let mut vertices: Vec<GridVertex> = Vec::with_capacity(TIMELINE_VERTICES);
+        // 先槽后进度：进度条盖在槽上，顺序反了就是「走到哪儿都看不见」。
+        push_quad(
+            &mut vertices,
+            TIMELINE_X0,
+            TIMELINE_X1,
+            TIMELINE_TRACK_COLOR,
+            0.45,
+        );
+        push_quad(
+            &mut vertices,
+            TIMELINE_X0,
+            TIMELINE_X0 + (TIMELINE_X1 - TIMELINE_X0) * progress,
+            TIMELINE_FILL_COLOR,
+            0.9,
+        );
+        debug_assert_eq!(vertices.len(), TIMELINE_VERTICES);
+        self.queue
+            .write_buffer(&self.timeline.buffer, 0, bytemuck::cast_slice(&vertices));
+        self.timeline.visible = true;
     }
 
     /// 窗口尺寸变化。宽或高归零（最小化）时不重配，留给下一次有效的 resize。
@@ -756,11 +1008,83 @@ impl Gfx {
                     }
                 }
             }
+            // 骨骼线框：模型的 draw 都发完之后再画，`Always` 深度比较让它浮在
+            // 最前面——这样「关节到底在身体里的哪儿」才看得出来。
+            if self.skeleton_visible {
+                if let Some(skeleton) = &self.skeleton {
+                    if skeleton.capacity > 0 {
+                        pass.set_pipeline(&self.skeleton_pipeline);
+                        pass.set_bind_group(0, &self.bind_group, &[]);
+                        pass.set_vertex_buffer(0, skeleton.buffer.slice(..));
+                        pass.draw(0..skeleton.capacity as u32, 0..1);
+                    }
+                }
+            }
+            // 时间轴不在这里画：覆盖层的管线没有深度模板状态，而这一段 pass 带了
+            // `Depth32Float`——wgpu 要求两者必须一致。与其给它挂一份用不到的深度
+            // 状态（还得配一次 depth attachment），不如让覆盖层独占一个不带深度的
+            // pass，本来它也不参与深度测试。
+        }
+        // 覆盖层单独一个 pass：`LoadOp::Load` 保住上一段画好的模型与骨架，不 Clear。
+        if self.timeline.visible {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("asset3d-viewport-timeline-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.timeline_pipeline);
+            pass.set_vertex_buffer(0, self.timeline.buffer.slice(..));
+            pass.draw(0..TIMELINE_VERTICES as u32, 0..1);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
     }
+}
+
+/// 把「关节槽位对」铺成 LineList 顶点。槽位越界的线两端都落在原点（退化），
+/// 而不是顺延去取下一根——那样画面上的连线会整体错位，比不画更误导。
+fn skeleton_vertices(lines: &[[u16; 2]], points: &[Vec3]) -> Vec<GridVertex> {
+    let mut vertices = Vec::with_capacity(lines.len() * 2);
+    for [from, to] in lines {
+        let from = points.get(*from as usize).copied().unwrap_or(Vec3::ZERO);
+        let to = points.get(*to as usize).copied().unwrap_or(Vec3::ZERO);
+        vertices.push(GridVertex {
+            pos: from.to_array(),
+            color: BONE_COLOR_FROM,
+        });
+        vertices.push(GridVertex {
+            pos: to.to_array(),
+            color: BONE_COLOR_TO,
+        });
+    }
+    vertices
+}
+
+/// 屏幕空间的一块矩形（两个三角形）。`alpha` 借用位置向量的 z 分量传进着色器。
+fn push_quad(out: &mut Vec<GridVertex>, x0: f32, x1: f32, color: [f32; 3], alpha: f32) {
+    let corner = |x: f32, y: f32| GridVertex {
+        pos: [x, y, alpha],
+        color,
+    };
+    let (y0, y1) = (TIMELINE_Y0, TIMELINE_Y1);
+    out.extend_from_slice(&[
+        corner(x0, y0),
+        corner(x1, y0),
+        corner(x1, y1),
+        corner(x0, y0),
+        corner(x1, y1),
+        corner(x0, y1),
+    ]);
 }
 
 /// 上传一张解码好的贴图。格式取 `Rgba8UnormSrgb`：像素字节原样（PNG 就是 sRGB），

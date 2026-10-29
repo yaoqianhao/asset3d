@@ -21,7 +21,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use glam::{Mat3, Mat4, Quat, Vec3};
 
-use crate::air::{AirDoc, AirMaterial, AirTexture, MaterialPart};
+use crate::air::{AirAnimation, AirDoc, AirMaterial, AirNode, AirTexture, MaterialPart};
 
 /// 贴图像素上限（64 Mi 像素 ≈ 4096×4096 的 RGBA）。超过就不解码：视口是看图的，
 /// 为了看一眼资产把 8K 贴图整块展开成 256 MB 像素，代价和收益完全不成比例。
@@ -100,6 +100,9 @@ pub struct Scene {
     pub texture_count: usize,
     /// 非致命问题（贴图解码失败 / 过大）：不影响开窗，但要说清为什么是纯色。
     pub notes: Vec<String>,
+    /// 可播放骨架与动画。资产既没有骨骼也没有动画时为 `None`——此时视口退化成
+    /// 纯静态看图，时间轴与骨骼线框都不该出现。
+    pub rig: Option<Rig>,
 }
 
 /// 解析一个资产文件。返回的 `Scene` 可以直接塞进 GPU 缓冲。
@@ -133,9 +136,11 @@ pub fn load(path: &Path) -> Result<Scene, String> {
             // embed_textures = true：视口拿不到宿主的 `host/fs.read`，GLB 的图像又在
             // 二进制 chunk 里（没有单独文件可读），只能让解析器顺手把它 base64 出来。
             // 代价是解析期内存翻倍，比起「贴图一律丢」这笔账划算。
-            crate::gltf::import(&mut doc, &bytes, &hint, false, true, fetch_ref)?;
+            // want_animations = true：第四刀之前这里是 `false`——那时视口不看时间轴，
+            // 解出来的轨道没人消费。从这一刀起播放头要驱动关节矩阵，没有轨道就没得播。
+            crate::gltf::import(&mut doc, &bytes, &hint, true, true, fetch_ref)?;
         }
-        _ => crate::fbx::import(&mut doc, &bytes, &hint, false, true)?,
+        _ => crate::fbx::import(&mut doc, &bytes, &hint, true, true)?,
     }
     merge(&doc, &dir)
 }
@@ -385,6 +390,10 @@ fn merge(doc: &AirDoc, dir: &Path) -> Result<Scene, String> {
     // 退化资产（单个面片）半径会是 0：给个下限，否则相机距离除零。
     let radius = ((max - min).length() * 0.5).max(1e-3);
 
+    // 骨架视图复用上面算好的绑定姿态矩阵：绑定姿态只是「时间轴上的一条特例」，
+    // 单独再算一遍既有第二份真相，也可能与包围盒口径漂开。
+    let rig = Rig::new(doc, &skin_offsets, &joint_matrices);
+
     Ok(Scene {
         triangle_count: indices.len() / 3,
         vertices,
@@ -397,6 +406,7 @@ fn merge(doc: &AirDoc, dir: &Path) -> Result<Scene, String> {
         mesh_count,
         texture_count,
         notes,
+        rig,
     })
 }
 
@@ -448,6 +458,256 @@ fn build_joint_matrices(
         }
     }
     (matrices, offsets)
+}
+
+/// 一个 skin 在骨架视图里的样子：关节节点 + 逆绑定矩阵 + 全局槽位起点。
+struct RigSkin {
+    /// 关节的**节点下标**，顺序与矩阵槽位一一对应。
+    nodes: Vec<u32>,
+    inverse_bind: Vec<Mat4>,
+    /// 该 skin 的第一根骨头在全局矩阵表里的槽位。
+    offset: u32,
+}
+
+/// 可播放的骨架：绑定姿态快照 + 动画轨道 + 逆绑定矩阵。
+///
+/// 为什么不在 `AirDoc` 上直接播：`AirDoc` 是「文件里的样子」，一旦被动画改写，
+/// 重载 / 切动画 / scrub 回 0 都拿不到原始姿态了。所以这里留一份 `bind_nodes`
+/// 做底图，每帧从它恢复再叠加动画——scrub 是幂等的，来回拖不会累积漂移。
+pub struct Rig {
+    bind_nodes: Vec<AirNode>,
+    /// 求值用的 TRS 副本，逐帧改写。
+    nodes: Vec<AirNode>,
+    /// 世界矩阵缓存，逐帧清空。`None` = 本帧没算过。
+    cache: Vec<Option<Mat4>>,
+    animations: Vec<AirAnimation>,
+    skins: Vec<RigSkin>,
+    /// 平铺的 `jointWorld × inverseBindMatrix`，直接喂给 GPU 的 storage buffer。
+    joint_matrices: Vec<[f32; 16]>,
+    /// 每根关节的世界位置（骨骼线框的端点）。
+    joint_points: Vec<Vec3>,
+    /// 骨骼父子对，元素是矩阵槽位。父不在同一 skin 里时不出线——跨 skin 连
+    /// 一根线在画面上就是「凭空多出一根棍子」。
+    bone_lines: Vec<[u16; 2]>,
+}
+
+impl Rig {
+    fn new(doc: &AirDoc, skin_offsets: &[u32], bind: &[[f32; 16]]) -> Option<Self> {
+        // 只有骨骼没有动画也要留：骨骼线框是「这个资产到底有没有绑对」的
+        // 第一眼判据；只有动画没有骨骼（纯节点动画）同样要留，时间轴得能播。
+        if doc.skins.is_empty() && doc.animations.is_empty() {
+            return None;
+        }
+        let mut skins = Vec::with_capacity(doc.skins.len());
+        let mut bone_lines: Vec<[u16; 2]> = Vec::new();
+        for (index, skin) in doc.skins.iter().enumerate() {
+            let mut slot_of: HashMap<u32, u32> = HashMap::with_capacity(skin.joints.len());
+            for (slot, node) in skin.joints.iter().enumerate() {
+                // 同一关节重复出现时以第一个槽位为准：重复槽位本身就是畸形数据，
+                // 后面那条线连到哪儿都是猜。
+                slot_of.entry(*node).or_insert(slot as u32);
+            }
+            let offset = skin_offsets.get(index).copied().unwrap_or(0);
+            for (slot, node) in skin.joints.iter().enumerate() {
+                let parent = doc
+                    .nodes
+                    .get(*node as usize)
+                    .and_then(|node| node.parent)
+                    .and_then(|parent| slot_of.get(&parent).copied());
+                if let Some(parent_slot) = parent {
+                    let from = offset.saturating_add(parent_slot).min(u16::MAX as u32) as u16;
+                    let to = offset.saturating_add(slot as u32).min(u16::MAX as u32) as u16;
+                    bone_lines.push([from, to]);
+                }
+            }
+            // 逆绑定矩阵口径与 `build_joint_matrices` 保持一致（缺失/非有限按单位阵）。
+            let inverse_bind = (0..skin.joints.len())
+                .map(|slot| {
+                    skin.inverse_bind_matrices
+                        .get(slot)
+                        .copied()
+                        .map(|matrix| Mat4::from_cols_array(&matrix))
+                        .filter(|matrix| matrix.is_finite())
+                        .unwrap_or(Mat4::IDENTITY)
+                })
+                .collect();
+            skins.push(RigSkin {
+                nodes: skin.joints.clone(),
+                inverse_bind,
+                offset,
+            });
+        }
+        let mut rig = Self {
+            bind_nodes: doc.nodes.clone(),
+            nodes: doc.nodes.clone(),
+            cache: vec![None; doc.nodes.len()],
+            animations: doc.animations.clone(),
+            skins,
+            joint_matrices: bind.to_vec(),
+            joint_points: Vec::new(),
+            bone_lines,
+        };
+        // 先摆一次绑定姿态：把 `joint_points` 填上，也让「不播动画」时矩阵表与
+        // `Scene::joint_matrices` 完全一致（同一份输入、同一套算式）。
+        rig.pose_at(None, 0.0);
+        Some(rig)
+    }
+
+    /// 在 `time` 处求值并写回矩阵表，返回被写入的轨道条数。
+    ///
+    /// `animation` 为 `None`（或下标失效）时退化成绑定姿态——这正是「暂停在 0
+    /// 秒」该有的样子，不需要另开一条 reset 路径。
+    pub fn pose_at(&mut self, animation: Option<usize>, time: f32) -> usize {
+        let written = {
+            let Self {
+                bind_nodes,
+                nodes,
+                animations,
+                ..
+            } = self;
+            nodes.clone_from(bind_nodes);
+            match animation.and_then(|index| animations.get(index)) {
+                Some(anim) => anim.apply_at(time, nodes),
+                None => 0,
+            }
+        };
+        let Self {
+            nodes,
+            cache,
+            skins,
+            joint_matrices,
+            joint_points,
+            ..
+        } = self;
+        for slot in cache.iter_mut() {
+            *slot = None;
+        }
+        joint_points.clear();
+        joint_points.resize(joint_matrices.len(), Vec3::ZERO);
+        for skin in skins.iter() {
+            for (slot, node) in skin.nodes.iter().enumerate() {
+                let world = node_world(nodes, *node as usize, cache, 0);
+                let inverse_bind = skin
+                    .inverse_bind
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(Mat4::IDENTITY);
+                let at = skin.offset as usize + slot;
+                if let Some(entry) = joint_matrices.get_mut(at) {
+                    *entry = (world * inverse_bind).to_cols_array();
+                }
+                if let Some(point) = joint_points.get_mut(at) {
+                    // 蒙皮矩阵的平移列是「顶点被推到哪」，骨骼端点要的是关节
+                    // 自己在世界里的位置，所以取 `world` 而不是上面的乘积。
+                    *point = world.w_axis.truncate();
+                }
+            }
+        }
+        written
+    }
+
+    pub fn joint_matrices(&self) -> &[[f32; 16]] {
+        &self.joint_matrices
+    }
+
+    pub fn joint_points(&self) -> &[Vec3] {
+        &self.joint_points
+    }
+
+    pub fn bone_lines(&self) -> &[[u16; 2]] {
+        &self.bone_lines
+    }
+
+    pub fn animation_count(&self) -> usize {
+        self.animations.len()
+    }
+
+    pub fn animation_name(&self, index: usize) -> Option<&str> {
+        self.animations.get(index).map(|anim| anim.name.as_str())
+    }
+
+    /// 动画时长（`effective_duration`：导入器没填 `duration` 时用轨道末端兜底）。
+    pub fn duration(&self, index: usize) -> f32 {
+        self.animations
+            .get(index)
+            .map(AirAnimation::effective_duration)
+            .unwrap_or(0.0)
+    }
+
+    /// 选一条动画：指定名字优先（忽略大小写，兼容 `Take 001` / `take 001`），
+    /// 名字对不上或没指定时退回第一条。`None` 表示这个资产根本没有动画。
+    pub fn pick_animation(&self, hint: Option<&str>) -> Option<usize> {
+        if self.animations.is_empty() {
+            return None;
+        }
+        let hint = hint.map(str::trim).filter(|hint| !hint.is_empty());
+        if let Some(hint) = hint {
+            if let Some(index) = self
+                .animations
+                .iter()
+                .position(|anim| anim.name.eq_ignore_ascii_case(hint))
+            {
+                return Some(index);
+            }
+        }
+        Some(0)
+    }
+
+    /// 名字提示是否真的命中了（没命中时调用方该提示一句，而不是假装播的是你要的）。
+    pub fn animation_name_matches(&self, index: usize, hint: Option<&str>) -> bool {
+        let Some(hint) = hint.map(str::trim).filter(|hint| !hint.is_empty()) else {
+            return true;
+        };
+        self.animation_name(index)
+            .is_some_and(|name| name.eq_ignore_ascii_case(hint))
+    }
+
+    /// 日志用的一句话概览：`3 条动画（Idle 2.5s / Run 1.2s / …）`。
+    pub fn animation_summary(&self) -> String {
+        let mut parts: Vec<String> = self
+            .animations
+            .iter()
+            .take(6)
+            .map(|anim| {
+                let name = if anim.name.is_empty() {
+                    "(未命名)"
+                } else {
+                    anim.name.as_str()
+                };
+                format!("{name} {:.2}s", anim.effective_duration())
+            })
+            .collect();
+        if self.animations.len() > parts.len() {
+            parts.push(format!("…共 {} 条", self.animations.len()));
+        }
+        format!(
+            "{} 条动画（{}）",
+            self.animations.len(),
+            parts.join(" / ")
+        )
+    }
+}
+
+/// 推进播放头，返回 `(新时间, 是否还在播)`。
+///
+/// 抽成纯函数是为了能脱开窗口测：播放循环里最容易错的就是「跨过末尾那一帧」
+/// 到底该 wrap 还是该停，而这类边界在 GUI 里几乎无法复现。
+pub fn advance_playhead(time: f32, dt: f32, duration: f32, looping: bool) -> (f32, bool) {
+    if !duration.is_finite() || duration <= 0.0 {
+        return (0.0, false);
+    }
+    // 单帧最多推进 0.1s：窗口拖动、断点会让 `dt` 变得很大，按真实间隔推进
+    // 就会「一恢复就跳好几秒」。
+    let time = time + dt.clamp(0.0, 0.1);
+    if time < duration {
+        return (time, true);
+    }
+    if looping {
+        // `rem_euclid` 而不是 `-=`：一帧跨过多个循环长度时也不会丢掉余数。
+        (time.rem_euclid(duration), true)
+    } else {
+        (duration, false)
+    }
 }
 
 /// 把 AIR 的材质段翻译成渲染侧材质：baseColor + 解码后的 baseColor 贴图。
@@ -570,10 +830,16 @@ fn decode(raw: &[u8], texture: &AirTexture) -> Result<TexImage, String> {
 
 /// 节点世界矩阵 = 父链累乘。`depth` 只是坏 `parent`（自环 / 越界）的保险丝。
 fn world_matrix(doc: &AirDoc, index: usize, cache: &mut Vec<Option<Mat4>>, depth: u32) -> Mat4 {
+    node_world(&doc.nodes, index, cache, depth)
+}
+
+/// [`world_matrix`] 的节点切片版本：动画播放要在**逐帧变动的 TRS 副本**上重算世界
+/// 矩阵，不能每次都回到 `AirDoc`（那里的 TRS 是绑定姿态）。
+fn node_world(nodes: &[AirNode], index: usize, cache: &mut Vec<Option<Mat4>>, depth: u32) -> Mat4 {
     if let Some(Some(cached)) = cache.get(index) {
         return *cached;
     }
-    let Some(node) = doc.nodes.get(index) else {
+    let Some(node) = nodes.get(index) else {
         return Mat4::IDENTITY;
     };
     let local = Mat4::from_scale_rotation_translation(
@@ -590,7 +856,7 @@ fn world_matrix(doc: &AirDoc, index: usize, cache: &mut Vec<Option<Mat4>>, depth
     let world = match node.parent {
         // 自环直接当根：真实资产里偶有导出器写坏 parent。
         Some(parent) if depth < 64 && parent as usize != index => {
-            world_matrix(doc, parent as usize, cache, depth + 1) * local
+            node_world(nodes, parent as usize, cache, depth + 1) * local
         }
         _ => local,
     };
@@ -690,6 +956,8 @@ pub fn reference_grid() -> Scene {
         triangle_count: 0,
         texture_count: 0,
         notes: Vec::new(),
+        // 地板没有骨骼也没有动画。
+        rig: None,
     }
 }
 
@@ -721,7 +989,7 @@ mod tests {
     // 去重、采样器）靠实机截图验证，不在这层断言。
 
     use super::*;
-    use crate::air::{AirMesh, AirNode, AirSkin};
+    use crate::air::{AirAnimation, AirMesh, AirNode, AirSkin, AirTrack};
 
     /// 一个 quad：4 顶点 2 三角形，UV 四角给极值，方便断言翻转。
     fn quad_mesh(parts: Vec<MaterialPart>, indices: Vec<u32>) -> AirMesh {
@@ -1056,5 +1324,97 @@ mod tests {
         let scene = merge(&doc, Path::new(".")).expect("越界索引不该挡住加载");
         assert_eq!(scene.skinned_vertex_count, 0);
         assert!(scene.vertices.iter().all(|v| v.joints == [0; 4]));
+    }
+
+    // ---- M-UI-4 第三刀：时间轴 ----
+
+    /// 一份「关节沿 X 平移 0→4、时长 1s」的文档。
+    fn animated_doc() -> AirDoc {
+        let joints = vec![[0u16, 0, 0, 0]; 4];
+        let weights = vec![[1.0f32, 0.0, 0.0, 0.0]; 4];
+        let mut doc = skinned_doc(glam::Vec3::ZERO, Mat4::IDENTITY, joints, weights);
+        doc.animations.push(AirAnimation {
+            name: "Walk".to_string(),
+            duration: 1.0,
+            tracks: vec![AirTrack {
+                node: 1,
+                property: "translation".to_string(),
+                interpolation: "linear".to_string(),
+                times: vec![0.0, 1.0],
+                values: vec![[0.0, 0.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0]],
+            }],
+        });
+        doc
+    }
+
+    /// 第三刀的核心断言：同一个 `Rig` 在不同时间求值，关节矩阵必须跟着动——
+    /// 这就是「动画真的驱动了 GPU 骨骼矩阵」的最小证据。
+    #[test]
+    fn rig_pose_drives_joint_matrices_over_time() {
+        let doc = animated_doc();
+        let mut scene = merge(&doc, Path::new(".")).expect("带动画的蒙皮场景应能加载");
+        let mut rig = scene.rig.take().expect("有蒙皮就该有 rig");
+
+        assert_eq!(rig.animation_count(), 1);
+        assert!((rig.duration(0) - 1.0).abs() < 1e-6);
+        // 名字大小写不敏感；对不上时退回第一条，而不是「什么都不播」。
+        assert_eq!(rig.pick_animation(Some("walk")), Some(0));
+        assert_eq!(rig.pick_animation(Some("Nope")), Some(0));
+        assert!(!rig.animation_name_matches(0, Some("Nope")));
+        assert!(rig.animation_name_matches(0, Some("WALK")));
+
+        rig.pose_at(Some(0), 0.0);
+        assert!(Mat4::from_cols_array(&rig.joint_matrices()[0])
+            .w_axis
+            .x
+            .abs()
+            < 1e-6);
+        // 半程走一半：线性插值给 2，容差留够（轨道采样内部按 f32 累加）。
+        rig.pose_at(Some(0), 0.5);
+        assert!((Mat4::from_cols_array(&rig.joint_matrices()[0]).w_axis.x - 2.0).abs() < 1e-3);
+        rig.pose_at(Some(0), 1.0);
+        assert!((Mat4::from_cols_array(&rig.joint_matrices()[0]).w_axis.x - 4.0).abs() < 1e-6);
+        // 骨骼端点跟的是关节自身世界位置，不是蒙皮矩阵的平移列。
+        assert!((rig.joint_points()[0].x - 4.0).abs() < 1e-6);
+
+        // 退回绑定姿态：矩阵必须干净地回到单位阵，不能残留上一次的姿态。
+        rig.pose_at(None, 0.0);
+        let back = Mat4::from_cols_array(&rig.joint_matrices()[0]);
+        for (actual, expected) in back
+            .to_cols_array()
+            .iter()
+            .zip(Mat4::IDENTITY.to_cols_array().iter())
+        {
+            assert!((actual - expected).abs() < 1e-6, "{back:?}");
+        }
+        assert!(rig.joint_points()[0].length() < 1e-6);
+    }
+
+    /// 播放头推进：末尾那一帧是 wrap 还是停，决定「循环开关」到底有没有用。
+    #[test]
+    fn playhead_wraps_or_stops_at_the_end() {
+        // 正常推进：一帧 50ms。
+        assert_eq!(advance_playhead(0.0, 0.05, 1.0, true), (0.05, true));
+        // 断点/拖动窗口会让 `dt` 很大：按 0.1s 截断，不许一次跳好几秒。
+        let (time, playing) = advance_playhead(0.0, 5.0, 1.0, true);
+        assert!((time - 0.1).abs() < 1e-6, "{time}");
+        assert!(playing);
+        // 跨过末尾 + 循环：余数保留（0.45 + 0.1 = 0.55 → 0.05）。
+        let (time, playing) = advance_playhead(0.45, 0.1, 0.5, true);
+        assert!((time - 0.05).abs() < 1e-6, "{time}");
+        assert!(playing);
+        // 跨过末尾 + 不循环：停在末尾。
+        let (time, playing) = advance_playhead(0.45, 0.1, 0.5, false);
+        assert!((time - 0.5).abs() < 1e-6, "{time}");
+        assert!(!playing);
+        // 一帧跨过多个循环长度（时长比截断步长还短）：余数仍然合法。
+        let (time, playing) = advance_playhead(0.02, 0.1, 0.03, true);
+        assert!((0.0..0.03).contains(&time), "{time}");
+        assert!(playing);
+        // 没有可播的动画：时间归零且不播，避免空转重绘。
+        assert_eq!(advance_playhead(0.3, 0.016, 0.0, true), (0.0, false));
+        assert_eq!(advance_playhead(0.3, 0.016, f32::NAN, true), (0.0, false));
+        // 负 `dt`（时间回拨）不推进，也不许把播放头拉成负数。
+        assert_eq!(advance_playhead(0.2, -1.0, 1.0, true), (0.2, true));
     }
 }

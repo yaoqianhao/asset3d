@@ -11,8 +11,10 @@
 use serde_json::{json, Value};
 
 /// 视口支持的能力集，握手时自述（`ready.capabilities`）。
-/// 静态渲染落地前只报 `static`，动画与蒙皮在 M-UI-4 补。
-pub const CAPABILITIES: [&str; 1] = ["static"];
+///
+/// 第三刀起报 `animated`：时间轴（play / scrub / loop）与骨骼线框都已落地，
+/// 蒙皮矩阵每帧按动画求值——对端可以据此把「播放」相关控件放出来了。
+pub const CAPABILITIES: [&str; 2] = ["static", "animated"];
 
 /// 协议版本，进每一帧的 `v` 字段。
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -108,8 +110,18 @@ pub fn ready_frame() -> String {
     .to_string()
 }
 
-/// 状态帧：`state{path, animation, time, playing, camera}`，只在离散事件上发。
-pub fn state_frame(path: &str, animation: Option<&str>, time: f32, playing: bool) -> String {
+/// 状态帧：`state{path, animation, time, playing, duration}`，只在离散事件上发。
+///
+/// `duration` 是当前动画的总时长（没有动画时为 0），对端据此画时间轴刻度——
+/// 让对端去猜时长只会画出比例永远不对的滑条。新增字段对老对端无影响（未知字段
+/// 一律忽略，见文件头第 1 条）。
+pub fn state_frame(
+    path: &str,
+    animation: Option<&str>,
+    time: f32,
+    playing: bool,
+    duration: f32,
+) -> String {
     json!({
         "v": PROTOCOL_VERSION,
         "op": "state",
@@ -118,6 +130,7 @@ pub fn state_frame(path: &str, animation: Option<&str>, time: f32, playing: bool
         "animation": animation,
         "time": time,
         "playing": playing,
+        "duration": duration,
     })
     .to_string()
 }
@@ -211,6 +224,8 @@ mod tests {
         assert_eq!(ready["op"], "ready");
         assert_eq!(ready["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(ready["capabilities"][0], "static");
+        // 第三刀的能力自述：对端据此决定要不要放播放控件。
+        assert_eq!(ready["capabilities"][1], "animated");
 
         let pong: Value = serde_json::from_str(&pong_frame(9)).unwrap();
         assert_eq!(pong["seq"], 9);
@@ -218,5 +233,18 @@ mod tests {
         let err: Value = serde_json::from_str(&error_frame(4, "unsupported", "x")).unwrap();
         assert_eq!(err["code"], "unsupported");
         assert_eq!(err["seq"], 4);
+    }
+
+    #[test]
+    fn state_frame_reports_duration() {
+        let state: Value = serde_json::from_str(&state_frame("a.glb", Some("Run"), 0.5, true, 1.25))
+            .unwrap();
+        assert_eq!(state["animation"], "Run");
+        assert_eq!(state["playing"], true);
+        assert!((state["duration"].as_f64().unwrap_or_default() - 1.25).abs() < 1e-6);
+        // 没有动画时也别省字段：对端拿 null 和拿 0 是两种分支。
+        let idle: Value =
+            serde_json::from_str(&state_frame("a.glb", None, 0.0, false, 0.0)).unwrap();
+        assert_eq!(idle["duration"], 0.0);
     }
 }
