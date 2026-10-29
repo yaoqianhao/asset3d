@@ -81,11 +81,18 @@ struct GpuScene {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     parts: Vec<GpuPart>,
+    /// 蒙皮矩阵（`jointWorld × inverseBindMatrix`）的 storage buffer。
+    /// 一份场景一份，顶点里的关节索引直接指进来。
+    bones: wgpu::BindGroup,
     /// 索引总数：分区之外的兜底绘制用（正常情况下分区覆盖全部三角形）。
     index_count: u32,
     /// 各材质的 uniform 缓冲。只为持有生命周期，渲染时不直接读。
     #[allow(dead_code)]
     material_uniforms: Vec<wgpu::Buffer>,
+    /// 骨骼 storage buffer 本体：bind group 会持有它，但显式留一份引用，
+    /// 避免「绑定还在、缓冲先被回收」这类只在特定后端出现的时序问题。
+    #[allow(dead_code)]
+    bone_buffer: wgpu::Buffer,
 }
 
 /// 渲染器。`surface` 用 `'static`：持有一份 `Arc<Window>` 的克隆，
@@ -108,6 +115,10 @@ pub struct Gfx {
     sampler: wgpu::Sampler,
     /// 默认材质的 bind group：场景没有分区（或分区不完整）时直接用它。
     fallback_bind: wgpu::BindGroup,
+    /// 骨骼绑定（group 2）的布局，以及「一份恒等矩阵」的兜底绑定：
+    /// 管线要求 group 2 必须绑上，静态资产也得占个位。
+    bone_layout: wgpu::BindGroupLayout,
+    fallback_bones: wgpu::BindGroup,
     depth: Option<wgpu::TextureView>,
     scene: Option<GpuScene>,
     /// 参考地板：常驻的一条线段缓冲。没有模型的空窗口靠它证明「视口活着」，
@@ -283,9 +294,46 @@ impl Gfx {
             })
         };
 
+        // ---- 骨骼（group 2）：只读 storage buffer，顶点着色器按索引取矩阵 ----
+        // 为什么是 storage 而不是 uniform：uniform 数组在默认 limits 下只有 64 KiB，
+        // 几百根骨头就到顶了；storage 一份 256 MiB 上限，蒙皮资产的天花板高得多。
+        let bone_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("asset3d-viewport-bone-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let fallback_bones = {
+            // 一份恒等矩阵：静态资产权重全零、根本不会读它，但 group 2 必须绑上，
+            // 否则管线校验直接失败。
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("asset3d-viewport-fallback-bones"),
+                contents: bytemuck::cast_slice(&[[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                    1.0f32,
+                ]]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("asset3d-viewport-fallback-bones-bind"),
+                layout: &bone_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            })
+        };
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("asset3d-viewport-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout, &material_layout],
+            bind_group_layouts: &[&bind_group_layout, &material_layout, &bone_layout],
             push_constant_ranges: &[],
         });
 
@@ -315,6 +363,18 @@ impl Gfx {
                             format: wgpu::VertexFormat::Float32x2,
                             offset: 24,
                             shader_location: 2,
+                        },
+                        // 关节索引：u16×4（WGSL 里读成 vec4<u32>），偏移 32。
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint16x4,
+                            offset: 32,
+                            shader_location: 3,
+                        },
+                        // 关节权重：f32×4，偏移 40（u16×4 = 8 字节对齐后）。
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 40,
+                            shader_location: 4,
                         },
                     ],
                 }],
@@ -453,6 +513,8 @@ impl Gfx {
             white_view,
             sampler,
             fallback_bind,
+            bone_layout,
+            fallback_bones,
             depth: Some(depth),
             scene: None,
             grid_pipeline,
@@ -480,6 +542,33 @@ impl Gfx {
                 contents: bytemuck::cast_slice(&scene.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+
+        // ---- 蒙皮矩阵：一张平铺的 storage buffer ----
+        // 没有蒙皮资产时也建一份（1 个恒等矩阵），省掉渲染路径里的 Option 分支。
+        let bone_buffer = {
+            let contents: Vec<[f32; 16]> = if scene.joint_matrices.is_empty() {
+                vec![[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                    1.0,
+                ]]
+            } else {
+                scene.joint_matrices.clone()
+            };
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("asset3d-viewport-bones"),
+                    contents: bytemuck::cast_slice(&contents),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let bones = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("asset3d-viewport-bones-bind"),
+            layout: &self.bone_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bone_buffer.as_entire_binding(),
+            }],
+        });
 
         // bind group 本身不实现 Clone（wgpu 22 的资源句柄都是唯一所有者），
         // 所以共享同一个材质时用 Arc 传引用，而不是复制一份 GPU 资源。
@@ -548,10 +637,12 @@ impl Gfx {
             vertices,
             indices,
             parts,
+            bones,
             index_count: scene.indices.len() as u32,
             // 缓冲句柄留着：bind group 会自己抓住资源，但保留一份引用能避免
             // 「绑定还在、缓冲先被回收」这种只在特定后端出现的时序问题。
             material_uniforms,
+            bone_buffer,
         });
     }
 
@@ -642,6 +733,9 @@ impl Gfx {
             if let Some(scene) = &self.scene {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
+                // group 2 是蒙皮矩阵：静态场景绑的是一份恒等矩阵占位，
+                // 着色器按权重为 0 走静态分支，读都读不到它。
+                pass.set_bind_group(2, &scene.bones, &[]);
                 pass.set_vertex_buffer(0, scene.vertices.slice(..));
                 pass.set_index_buffer(scene.indices.slice(..), wgpu::IndexFormat::Uint32);
                 if scene.parts.is_empty() {

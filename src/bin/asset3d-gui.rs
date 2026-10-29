@@ -19,7 +19,10 @@
 //! 左键拖动转视角、滚轮推拉、`O` 打开文件、拖文件进窗口直接看、`Esc` 清空。
 //! 第二刀到「打开资产能看出形状」为止（纯色几何 + 参考网格）；第三刀补上材质贴图：
 //! 顶点带 UV，按 AIR 的 `material_parts` 分区各配一份 baseColor 与贴图，缺图退回纯色。
-//! 仍然只画静态网格——不播动画、不做蒙皮，`capabilities` 也只报 `static`。
+//! 仍然不播动画：M-UI-4 第二刀只把「绑定姿态」算对——顶点带 4 个关节槽位与
+//! 权重，关节矩阵走 `group(2)` 的只读 storage buffer，在顶点着色器里做线性混合
+//! 蒙皮，所以骨架摆好的模型一打开就是对的姿势。`capabilities` 仍只报 `static`：
+//! 从对端看它不跟时间轴，就是一张静态画面。
 //! 没有资产时不再是一个「什么都没反应」的空窗口：双击形态启动即弹文件对话框，
 //! 窗口标题也写明了拖入 / `O` 两种入口。
 
@@ -325,6 +328,15 @@ impl ViewportApp {
             scene.triangle_count,
             scene.texture_count
         );
+        // 蒙皮单独报一行：资产「有骨骼」和「真的在用骨骼」是两件事，出问题时
+        // 第一眼要看的就是这里是不是 0。
+        if !scene.joint_matrices.is_empty() {
+            eprintln!(
+                "asset3d-gui: 蒙皮 {} 个关节矩阵，{} 个顶点参与变形",
+                scene.joint_matrices.len(),
+                scene.skinned_vertex_count
+            );
+        }
         // 贴图缺失、尺寸超限这类问题不影响开窗，但会让资产看起来是纯色的。
         // 不打出来，用户第一反应就是「视口坏了」。
         for note in &scene.notes {

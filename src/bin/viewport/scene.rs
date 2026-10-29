@@ -27,14 +27,22 @@ use crate::air::{AirDoc, AirMaterial, AirTexture, MaterialPart};
 /// 为了看一眼资产把 8K 贴图整块展开成 256 MB 像素，代价和收益完全不成比例。
 const MAX_TEXTURE_PIXELS: u64 = 4096 * 4096;
 
-/// GPU 顶点：位置 + 法线 + UV。与 `shader.wgsl` 的 `VsIn` 逐字段对应，
-/// 步长 32 字节（`f32 × 8`）。
+/// GPU 顶点：位置 + 法线 + UV + 4 个关节槽位。与 `shader.wgsl` 的 `VsIn`
+/// 逐字段对应，步长 56 字节（`f32 × 12 + u16 × 4`）。
+///
+/// 蒙皮与非蒙皮共用一份布局，靠 `weights` 是否全零区分：全零的顶点位置/法线
+/// 已经是**世界空间**（合并时烘进了节点矩阵），非零的留在 **mesh 局部空间**，
+/// 由着色器用关节矩阵算到世界。这样一份顶点流能同时装蒙皮与非蒙皮网格。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// 关节索引，指向 `Scene::joint_matrices` 的全局槽位。
+    pub joints: [u16; 4],
+    /// 关节权重，和为 1；全零表示「这个顶点不蒙皮」。
+    pub weights: [f32; 4],
 }
 
 /// 解码后的贴图：RGBA8 紧密排列，行序自上而下（与 wgpu 的纹理坐标 v=0 对齐）。
@@ -77,6 +85,11 @@ pub struct Scene {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub parts: Vec<ScenePart>,
+    /// 蒙皮矩阵：`jointWorld × inverseBindMatrix`，列主序。顶点里的 `joints[i]`
+    /// 就是这个数组的下标；非蒙皮场景为空。
+    pub joint_matrices: Vec<[f32; 16]>,
+    /// 参与蒙皮的顶点数（日志用：区分「资产有骨骼」与「资产真的在用骨骼」）。
+    pub skinned_vertex_count: usize,
     /// 包围盒中心（世界空间）。
     pub center: Vec3,
     /// 包围球半径，用来定相机距离与远近裁剪面。
@@ -143,6 +156,19 @@ fn merge(doc: &AirDoc, dir: &Path) -> Result<Scene, String> {
     // 这个判断读的是 AIR 的 `units.uv_origin`，不是格式名——将来换解析器也不会错。
     let flip_v = doc.units.uv_origin == "bottom-left";
 
+    // 蒙皮矩阵表：`jointWorld × inverseBindMatrix`，全文档平铺成一个数组，
+    // 顶点里的关节索引是全局槽位（`skin_offsets[skin] + local`）。这样一份
+    // storage buffer 就能装下所有蒙皮网格，不必每个 skin 一个 bind group。
+    let (joint_matrices, skin_offsets) = build_joint_matrices(doc, &mut cache, &mut notes);
+    let joint_total = joint_matrices.len() as u32;
+    let mut skinned_vertex_count = 0usize;
+    // 取景用的包围盒按**世界空间**累计：蒙皮顶点自身留在局部空间（着色器才算得
+    // 出世界位置），但 bind pose 的世界位置就是节点矩阵作用后的结果，用它定相机
+    // 距离与裁剪面既正确又稳定。
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut missing_skin_notes = 0usize;
+
     for node in &doc.nodes {
         let Some(mesh_index) = node.mesh else { continue };
         let Some(mesh) = doc.meshes.get(mesh_index as usize) else {
@@ -163,8 +189,26 @@ fn merge(doc: &AirDoc, dir: &Path) -> Result<Scene, String> {
             }
         };
         let base = vertices.len() as u32;
+        // ---- 这个网格能不能蒙皮 ----
+        // 条件：节点挂了 skin、skin 存在、mesh 的 joints/weights 与顶点数一一对应。
+        // 任一不满足就退回「烘世界矩阵」的老路——宁可不蒙皮，也不要画出塌成一团
+        // 的模型（缺权重时整块面会被拉到原点）。
+        let skin_base = node.skin.and_then(|skin_index| {
+            let usable = doc.skins.get(skin_index as usize).is_some()
+                && mesh.joints.len() == mesh.positions.len()
+                && mesh.weights.len() == mesh.positions.len();
+            if !usable && missing_skin_notes < 3 {
+                missing_skin_notes += 1;
+                notes.push(format!(
+                    "网格「{}」声明了蒙皮但关节/权重与顶点数不匹配：按静态网格绘制",
+                    mesh.name
+                ));
+            }
+            usable.then(|| skin_offsets.get(skin_index as usize).copied().unwrap_or(0))
+        });
         for (index, position) in mesh.positions.iter().enumerate() {
-            let world_pos = world.transform_point3(Vec3::from_array(*position));
+            let local = Vec3::from_array(*position);
+            let world_pos = world.transform_point3(local);
             let normal = mesh
                 .normals
                 .get(index)
@@ -186,10 +230,80 @@ fn merge(doc: &AirDoc, dir: &Path) -> Result<Scene, String> {
             if flip_v {
                 uv[1] = 1.0 - uv[1];
             }
+
+            // ---- 权重清洗 ----
+            // 导出器常留脏数据：和为 0、NaN、负值、索引越界。NaN / 负值按槽位丢弃
+            // 后重新归一化；只有「和为 0」或「有越界槽位」才让整个顶点退回静态
+            // 路径（robust access 会给 0 矩阵，顶点直接塌到原点，宁可不动）。
+            let mut joints = [0u16; 4];
+            let mut weights = [0.0f32; 4];
+            let mut skinned = false;
+            if let Some(skin_base) = skin_base {
+                let raw_weights = mesh.weights[index];
+                let sum: f32 = raw_weights
+                    .iter()
+                    .filter(|weight| weight.is_finite() && **weight > 0.0)
+                    .sum();
+                if sum > 1e-6 {
+                    let raw_joints = mesh.joints[index];
+                    let mut valid = true;
+                    for slot in 0..4 {
+                        let global = skin_base as u32 + raw_joints[slot] as u32;
+                        if raw_weights[slot] > 0.0 && global >= joint_total {
+                            valid = false;
+                        }
+                        weights[slot] = if raw_weights[slot].is_finite() && raw_weights[slot] > 0.0 {
+                            raw_weights[slot] / sum
+                        } else {
+                            0.0
+                        };
+                        joints[slot] = global.min(u16::MAX as u32) as u16;
+                    }
+                    skinned = valid;
+                }
+            }
+            if skinned {
+                skinned_vertex_count += 1;
+            } else {
+                weights = [0.0; 4];
+                joints = [0; 4];
+            }
+
+            // 取景包围盒要用「绑定姿态下真正画出来的位置」：非蒙皮顶点就是
+            // world_pos，蒙皮顶点得把关节矩阵算一遍（着色器里做的事，这里为
+            // 了定相机距离先算一次）。不算的话，带骨骼位移的资产会被按未骨
+            // 变换的位置取景，模型跑到画面外。
+            let bound_pos = if skinned {
+                let mut posed = Vec3::ZERO;
+                for slot in 0..4 {
+                    if weights[slot] > 0.0 {
+                        let matrix = Mat4::from_cols_array(&joint_matrices[joints[slot] as usize]);
+                        posed += matrix.transform_point3(local) * weights[slot];
+                    }
+                }
+                posed
+            } else {
+                world_pos
+            };
+            min = min.min(bound_pos);
+            max = max.max(bound_pos);
             vertices.push(Vertex {
-                pos: world_pos.to_array(),
-                normal: normal.to_array(),
+                // 蒙皮顶点留在 mesh 局部空间：着色器用关节矩阵把它算到世界，
+                // 变形才发生在 GPU 上。非蒙皮顶点直接把世界位置烘进去。
+                pos: if skinned {
+                    local.to_array()
+                } else {
+                    world_pos.to_array()
+                },
+                // 蒙皮时法线也留在局部空间，由关节矩阵的 3×3 部分变换。
+                normal: if skinned {
+                    mesh.normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0])
+                } else {
+                    normal.to_array()
+                },
                 uv,
+                joints,
+                weights,
             });
         }
 
@@ -264,15 +378,6 @@ fn merge(doc: &AirDoc, dir: &Path) -> Result<Scene, String> {
             .unwrap_or_else(|| "资产里没有可显示的网格（可能只有骨骼 / 相机 / 灯光）".to_string()));
     }
 
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for vertex in &vertices {
-        let position = Vec3::from_array(vertex.pos);
-        if position.is_finite() {
-            min = min.min(position);
-            max = max.max(position);
-        }
-    }
     if !min.is_finite() || !max.is_finite() {
         return Err("顶点坐标里没有有限值（资产可能全是 NaN）".to_string());
     }
@@ -285,12 +390,64 @@ fn merge(doc: &AirDoc, dir: &Path) -> Result<Scene, String> {
         vertices,
         indices,
         parts,
+        joint_matrices,
+        skinned_vertex_count,
         center,
         radius,
         mesh_count,
         texture_count,
         notes,
     })
+}
+
+/// 把文档里所有 skin 展开成一张平铺的关节矩阵表。
+///
+/// 返回 `(矩阵表, 每个 skin 在表里的起始槽位)`。矩阵按列主序存 `[f32; 16]`，
+/// 与 WGSL 的 `mat4x4<f32>` 内存布局一致，可以直接 `cast_slice` 上传。
+///
+/// 口径：`jointWorld × inverseBindMatrix`。顶点是 **mesh 局部坐标**，乘上它就
+/// 落到世界空间——这是 glTF skinning 的标准式，蒙皮网格自身的节点变换不参与
+/// （它已经含在关节世界矩阵里了）。
+fn build_joint_matrices(
+    doc: &AirDoc,
+    cache: &mut Vec<Option<Mat4>>,
+    notes: &mut Vec<String>,
+) -> (Vec<[f32; 16]>, Vec<u32>) {
+    let mut matrices: Vec<[f32; 16]> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::with_capacity(doc.skins.len());
+    for (index, skin) in doc.skins.iter().enumerate() {
+        offsets.push(matrices.len() as u32);
+        let count = skin.joints.len();
+        if skin.inverse_bind_matrices.len() != count && notes.len() < 12 {
+            // 缺逆绑定矩阵不等于不能显示：按单位矩阵补，模型会「略微不对」但能看。
+            notes.push(format!(
+                "蒙皮 #{index}：关节数 {count} 与逆绑定矩阵数 {} 不一致，缺失按单位矩阵补齐",
+                skin.inverse_bind_matrices.len()
+            ));
+        }
+        for slot in 0..count {
+            let inverse_bind = skin
+                .inverse_bind_matrices
+                .get(slot)
+                .copied()
+                .map(|matrix: [f32; 16]| Mat4::from_cols_array(&matrix))
+                .filter(|matrix| matrix.is_finite())
+                .unwrap_or(Mat4::IDENTITY);
+            let joint = skin.joints[slot] as usize;
+            let world = if joint < doc.nodes.len() {
+                world_matrix(doc, joint, cache, 0)
+            } else {
+                if notes.len() < 12 {
+                    notes.push(format!(
+                        "蒙皮 #{index}：槽位 {slot} 指向不存在的节点 {joint}，按单位矩阵处理"
+                    ));
+                }
+                Mat4::IDENTITY
+            };
+            matrices.push((world * inverse_bind).to_cols_array());
+        }
+    }
+    (matrices, offsets)
 }
 
 /// 把 AIR 的材质段翻译成渲染侧材质：baseColor + 解码后的 baseColor 贴图。
@@ -492,11 +649,15 @@ pub fn reference_grid() -> Scene {
             pos: from,
             normal: color,
             uv: [0.0, 0.0],
+            joints: [0; 4],
+            weights: [0.0; 4],
         });
         vertices.push(Vertex {
             pos: to,
             normal: color,
             uv: [0.0, 0.0],
+            joints: [0; 4],
+            weights: [0.0; 4],
         });
     };
 
@@ -520,6 +681,9 @@ pub fn reference_grid() -> Scene {
         vertices,
         indices: Vec::new(),
         parts: Vec::new(),
+        // 地板不蒙皮：关节表空，顶点权重全零，着色器走静态路径。
+        joint_matrices: Vec::new(),
+        skinned_vertex_count: 0,
         center: Vec3::ZERO,
         radius: span,
         mesh_count: 0,
@@ -557,7 +721,7 @@ mod tests {
     // 去重、采样器）靠实机截图验证，不在这层断言。
 
     use super::*;
-    use crate::air::{AirMesh, AirNode};
+    use crate::air::{AirMesh, AirNode, AirSkin};
 
     /// 一个 quad：4 顶点 2 三角形，UV 四角给极值，方便断言翻转。
     fn quad_mesh(parts: Vec<MaterialPart>, indices: Vec<u32>) -> AirMesh {
@@ -779,5 +943,118 @@ mod tests {
             Err(reason) => reason,
         };
         assert!(reason.contains("PNG"), "{reason}");
+    }
+
+    // ---- M-UI-4 第二刀：蒙皮 ----
+
+    use glam::Mat4;
+
+    /// 构造一份「一个蒙皮网格 + 一根关节」的文档。关节是根节点，世界矩阵就是
+    /// 它的 TRS；`inverse_bind` 由调用方给，用来模拟 bind pose / 任意姿态。
+    fn skinned_doc(
+        joint_translation: glam::Vec3,
+        inverse_bind: Mat4,
+        joints: Vec<[u16; 4]>,
+        weights: Vec<[f32; 4]>,
+    ) -> AirDoc {
+        let mut mesh = quad_mesh(vec![], vec![0, 1, 2, 0, 2, 3]);
+        mesh.joints = joints;
+        mesh.weights = weights;
+        let mut doc = doc_with(mesh);
+        doc.nodes[0].skin = Some(0);
+        doc.nodes.push(AirNode {
+            name: "joint".to_string(),
+            index: 1,
+            position: joint_translation.to_array(),
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0, 1.0, 1.0],
+            ..Default::default()
+        });
+        doc.skins.push(AirSkin {
+            index: 0,
+            name: "skin".to_string(),
+            joints: vec![1],
+            inverse_bind_matrices: vec![inverse_bind.to_cols_array()],
+        });
+        doc
+    }
+
+    /// 顶点权重全 1、关节指向平移 (2,0,0) 的根节点：矩阵第 4 列必须是平移，
+    /// 顶点留在局部空间（着色器才算得出世界位置），权重和为 1。
+    #[test]
+    fn skin_matrix_bakes_joint_world_times_inverse_bind() {
+        let joints = vec![[0u16, 0, 0, 0]; 4];
+        let weights = vec![[1.0f32, 0.0, 0.0, 0.0]; 4];
+        let doc = skinned_doc(glam::Vec3::new(2.0, 0.0, 0.0), Mat4::IDENTITY, joints, weights);
+        let scene = merge(&doc, Path::new(".")).expect("蒙皮场景应能加载");
+
+        assert_eq!(scene.joint_matrices.len(), 1);
+        let matrix = Mat4::from_cols_array(&scene.joint_matrices[0]);
+        assert!((matrix.w_axis.x - 2.0).abs() < 1e-6, "{matrix:?}");
+        assert_eq!(scene.skinned_vertex_count, 4);
+        // 蒙皮顶点必须是局部坐标：quad 的四角是 ±1，不能被烘到世界。
+        assert!((scene.vertices[0].pos[0] + 1.0).abs() < 1e-6);
+        assert_eq!(scene.vertices[0].joints[0], 0);
+        let sum: f32 = scene.vertices[0].weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        // 包络按世界位置算：平移 2 之后中心 x 应在 2 附近。
+        assert!((scene.center.x - 2.0).abs() < 1e-6, "{:?}", scene.center);
+    }
+
+    /// bind pose 的判据：`inverse_bind = inverse(jointWorld)` 时矩阵退回单位阵，
+    /// 顶点算出来必须还是原地——这正是「不播放动画时模型不变形」的数学保证。
+    #[test]
+    fn bind_pose_degenerates_to_identity() {
+        let joint_world = Mat4::from_translation(glam::Vec3::new(2.0, 0.0, 0.0));
+        let joints = vec![[0u16, 0, 0, 0]; 4];
+        let weights = vec![[1.0f32, 0.0, 0.0, 0.0]; 4];
+        let doc = skinned_doc(
+            glam::Vec3::new(2.0, 0.0, 0.0),
+            joint_world.inverse(),
+            joints,
+            weights,
+        );
+        let scene = merge(&doc, Path::new(".")).expect("蒙皮场景应能加载");
+        let matrix = Mat4::from_cols_array(&scene.joint_matrices[0]);
+        for (actual, expected) in matrix.to_cols_array().iter().zip(
+            Mat4::IDENTITY
+                .to_cols_array()
+                .iter(),
+        ) {
+            assert!((actual - expected).abs() < 1e-6, "{matrix:?}");
+        }
+    }
+
+    /// 脏权重按槽位清洗：NaN 与负值置 0，剩下的重新归一化；全零才退回静态。
+    /// 「清洗」和「回退」是两条不同的路径——能救的顶点不该被整体放弃。
+    #[test]
+    fn dirty_weights_are_scrubbed_not_dropped() {
+        let joints = vec![[0u16, 0, 0, 0]; 4];
+        let mut weights = vec![[0.0f32; 4]; 4];
+        // NaN 与 -1 都不该参与；0.5 归一化后是 1.0。
+        weights[1] = [f32::NAN, 0.5, -1.0, 0.0];
+        let doc = skinned_doc(glam::Vec3::ZERO, Mat4::IDENTITY, joints, weights);
+        let scene = merge(&doc, Path::new(".")).expect("脏权重不该挡住加载");
+
+        assert_eq!(scene.skinned_vertex_count, 1);
+        let scrubbed = scene.vertices[1].weights;
+        assert_eq!(scrubbed[0], 0.0);
+        assert_eq!(scrubbed[1], 1.0);
+        assert_eq!(scrubbed[2], 0.0);
+        let sum: f32 = scrubbed.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        // 其余顶点权重本来就是 0：它们必须走静态路径，位置是世界空间。
+        assert_eq!(scene.vertices[0].weights, [0.0; 4]);
+    }
+
+    /// 越界关节索引同样退回静态：宁可这幅面不蒙皮，也不要整块塌掉。
+    #[test]
+    fn out_of_range_joint_index_falls_back_to_static() {
+        let joints = vec![[7u16, 0, 0, 0]; 4];
+        let weights = vec![[1.0f32, 0.0, 0.0, 0.0]; 4];
+        let doc = skinned_doc(glam::Vec3::ZERO, Mat4::IDENTITY, joints, weights);
+        let scene = merge(&doc, Path::new(".")).expect("越界索引不该挡住加载");
+        assert_eq!(scene.skinned_vertex_count, 0);
+        assert!(scene.vertices.iter().all(|v| v.joints == [0; 4]));
     }
 }
