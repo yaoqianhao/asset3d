@@ -15,6 +15,13 @@ description = "ai-ide 插件：读取 FBX/GLB 3D 资产，解析并归一化为�
 name = "asset3d-gui"
 path = "src/bin/asset3d-gui.rs"
 
+# 动作重定向转换器 `asset3d-retarget.exe`：把 UE5 Mannequin 的动作序列搬到
+# Tripo 绑定的人形角色上，输出可直接播放的新 GLB。纯离线批处理，不开窗口，
+# 因此与视口进程完全解耦。
+[[bin]]
+name = "asset3d-retarget"
+path = "src/bin/asset3d-retarget.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
