@@ -12,12 +12,26 @@
 
 use crate::air::{AirDoc, AirMesh};
 
-/// 单张贴图的 base64 上限：超了就不内嵌（避免一个 4K PBR 贴图把分片撑到几十 MB）。
+/// 单张贴图**原始编码字节**上限（6 MiB）：超了就不内嵌（避免一个 8K PBR 贴图
+/// 把分片撑到几十 MB）。
+///
+/// 注意判的是原图字节数而不是 base64 字符串长度：`data_base64` 比原图长 1/3，
+/// 拿字符串长度当口径等于把上限偷偷压到 4.5 MiB，Tripo 那批 8192×8192 的
+/// baseColor（原图 4.9 MB / 6.2 MB、base64 6.6 MB / 8.3 MB）就会被误判成
+/// `dropped`，预览页只剩白色 baseColor——「资产有贴图，页面却说是纯色」。
 const MAX_TEXTURE_BYTES: usize = 6 * 1024 * 1024;
-/// 全部贴图 base64 之和的上限。
+/// 全部贴图**原始编码字节**之和的上限（24 MiB）。
 const MAX_TEXTURE_TOTAL: usize = 24 * 1024 * 1024;
 /// 分片切分时在宿主预算之外再留的余量：保证每片**严格低于**闸门，而不是卡着线过。
 const SHARD_MARGIN: usize = 1024;
+
+/// base64 字符数 → 原始字节数（`len / 4 * 3`）。
+///
+/// AIR 的贴图存的是 base64，但闸门关心的是「原图多大」（解码耗时、GPU 上传量），
+/// 所以判定前统一换算。带 `=` 填充时最多高估 2 字节，对 6 MiB 级别的阈值无意义。
+fn raw_texture_bytes(encoded_len: usize) -> usize {
+    encoded_len / 4 * 3
+}
 
 /// 预览生成结果。
 pub struct ViewOutcome {
@@ -426,7 +440,10 @@ fn gate_textures(doc: &mut AirDoc, notes: &mut Vec<String>) -> (usize, Vec<Strin
         let Some(data) = texture.data_base64.take() else {
             continue;
         };
-        if data.len() > MAX_TEXTURE_BYTES || embedded_bytes + data.len() > MAX_TEXTURE_TOTAL {
+        // 判口径是「原图多大」，所以先把 base64 长度换算回原始字节；直接用
+        // `data.len()` 会让 1/3 的编码膨胀吃掉预算。
+        let raw_bytes = raw_texture_bytes(data.len());
+        if raw_bytes > MAX_TEXTURE_BYTES || embedded_bytes + raw_bytes > MAX_TEXTURE_TOTAL {
             let label = if texture.name.is_empty() {
                 format!("#{index}")
             } else {
@@ -439,14 +456,15 @@ fn gate_textures(doc: &mut AirDoc, notes: &mut Vec<String>) -> (usize, Vec<Strin
             stash.push((index, data, was_embedded));
             continue;
         }
-        embedded_bytes += data.len();
+        embedded_bytes += raw_bytes;
         embedded += 1;
         texture.data_base64 = Some(data);
     }
 
     if !dropped.is_empty() {
         notes.push(format!(
-            "{} 张贴图因为体积超限没有内嵌，预览里退回材质的 baseColor：{}",
+            "{} 张贴图因为原图体积超限没有内嵌，预览里只显示材质的 baseColor（多为白色，看起来像白模），\
+             不是资产缺贴图；要看完整贴图请用 GUI 视口打开同一资产：{}",
             dropped.len(),
             dropped.join("、")
         ));
@@ -610,11 +628,13 @@ mod tests {
     #[test]
     fn oversized_texture_is_restored_and_named() {
         let mut doc = doc_with(vec![grid_mesh(2)]);
+        // 闸门判的是原图字节数，所以 base64 要按 4/3 膨胀才越过阈值。
+        let encoded_len = MAX_TEXTURE_BYTES / 3 * 4 + 4;
         doc.textures.push(AirTexture {
             name: "huge_albedo".to_string(),
             mime_type: "image/png".to_string(),
             embedded: true,
-            data_base64: Some("A".repeat(MAX_TEXTURE_BYTES + 1)),
+            data_base64: Some("A".repeat(encoded_len)),
             ..Default::default()
         });
 
@@ -623,8 +643,41 @@ mod tests {
         assert_eq!(embedded, 0);
         assert_eq!(dropped, vec!["huge_albedo".to_string()]);
         let data = doc.textures[0].data_base64.as_ref().expect("take() 之后必须放回");
-        assert_eq!(data.len(), MAX_TEXTURE_BYTES + 1, "放回的数据不能被动过");
+        assert_eq!(data.len(), encoded_len, "放回的数据不能被动过");
         assert!(notes.iter().any(|note| note.contains("huge_albedo")));
+    }
+
+    /// 回归：base64 长度超过 6 MiB、但**原图**没超的贴图必须内嵌。
+    ///
+    /// 8192×8192 的 JPEG baseColor 正是这种形状（rebelsoldier 原图 4.92 MB /
+    /// base64 6.56 MB）。按字符串长度判定会把它误丢，预览页于是退化成纯白模型，
+    /// 看起来就像「贴图没导入」。
+    #[test]
+    fn texture_is_gated_by_raw_bytes_not_base64_length() {
+        let mut doc = doc_with(vec![grid_mesh(2)]);
+        let encoded_len = 6_560_656; // 原图 4.92 MB → base64 6.56 MB
+        assert!(
+            encoded_len > MAX_TEXTURE_BYTES,
+            "测试前提：base64 长度必须已越过阈值"
+        );
+        doc.textures.push(AirTexture {
+            name: "rebelsoldier_basecolor".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            embedded: true,
+            data_base64: Some("A".repeat(encoded_len)),
+            ..Default::default()
+        });
+
+        let mut notes = Vec::new();
+        let (embedded, dropped) = gate_textures(&mut doc, &mut notes);
+        assert_eq!(embedded, 1, "原图 4.9 MB 没超 6 MiB，必须内嵌");
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(
+            raw_texture_bytes(encoded_len),
+            encoded_len / 4 * 3,
+            "换算口径要稳定可复算"
+        );
+        assert!(!notes.iter().any(|note| note.contains("没有内嵌")));
     }
 
     /// 缺陷①：每片都严格低于预算，且真的被切成了多片。

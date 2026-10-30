@@ -23,9 +23,17 @@ use glam::{Mat3, Mat4, Quat, Vec3};
 
 use crate::air::{AirAnimation, AirDoc, AirMaterial, AirNode, AirTexture, MaterialPart};
 
-/// 贴图像素上限（64 Mi 像素 ≈ 4096×4096 的 RGBA）。超过就不解码：视口是看图的，
-/// 为了看一眼资产把 8K 贴图整块展开成 256 MB 像素，代价和收益完全不成比例。
-const MAX_TEXTURE_PIXELS: u64 = 4096 * 4096;
+/// 贴图长边上限（4096）。GPU 的 `max_texture_dimension_2d` 保底值就是 4096，
+/// 同时把 RGBA8 展开面积压到 64 Mi 像素（256 MB）。
+const MAX_TEXTURE_EDGE: u32 = 4096;
+
+/// 贴图像素上限（64 Mi 像素 = 4096×4096 的 RGBA）。
+///
+/// 它是**降采样的触发线，不是解码的否决线**：超过这条线就按比例缩到
+/// [`MAX_TEXTURE_EDGE`] 以内再上传。早先这里是「超了就 `Err`」，而 Tripo 那批资产的
+/// `baseColorFactor` 是 (1,1,1,1)、颜色全在 8192×8192 的 baseColorTexture 里，
+/// 一丢就等于整块白模——省下 200 MB 显存换来「看不见资产」，不划算。
+const MAX_TEXTURE_PIXELS: u64 = (MAX_TEXTURE_EDGE as u64) * (MAX_TEXTURE_EDGE as u64);
 
 /// GPU 顶点：位置 + 法线 + UV + 4 个关节槽位。与 `shader.wgsl` 的 `VsIn`
 /// 逐字段对应，步长 56 字节（`f32 × 12 + u16 × 4`）。
@@ -50,6 +58,9 @@ pub struct TexImage {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// 原图尺寸；`Some` 表示这份像素是降采样后的版本（原图超过 [`MAX_TEXTURE_EDGE`]）。
+    /// 拿来写 `notes`，免得用户以为贴图被裁坏或根本没加载。
+    pub downscaled_from: Option<(u32, u32)>,
 }
 
 /// 一份材质。`key` 用于渲染侧给 bind group 去重（同一材质被多个 mesh 引用时，
@@ -773,6 +784,19 @@ fn texture_image(
         let raw = read_texture_bytes(dir, texture)?;
         match decode(&raw, texture) {
             Ok(image) => {
+                // 降采样是「看得到但缩过」，必须写清楚实际尺寸：不然用户只会觉得贴图糊，
+                // 或者反过来以为资产里就是 4K 贴图。
+                if let Some((original_w, original_h)) = image.downscaled_from {
+                    if notes.len() < 12 {
+                        notes.push(format!(
+                            "贴图 `{}` {original_w}×{original_h} 超出 {edge}×{edge} 上限，已降采样到 {}×{} 后上传",
+                            texture.name,
+                            image.width,
+                            image.height,
+                            edge = MAX_TEXTURE_EDGE,
+                        ));
+                    }
+                }
                 *decoded += 1;
                 Some(Arc::new(image))
             }
@@ -812,20 +836,51 @@ fn decode(raw: &[u8], texture: &AirTexture) -> Result<TexImage, String> {
     }
     let image = image::load_from_memory_with_format(raw, format)
         .map_err(|err| format!("解码失败：{err}"))?;
-    let rgba = image.to_rgba8();
-    let (width, height) = rgba.dimensions();
+    let mut rgba = image.to_rgba8();
+    let (mut width, mut height) = rgba.dimensions();
+    let mut downscaled_from = None;
     if u64::from(width) * u64::from(height) > MAX_TEXTURE_PIXELS {
-        return Err(format!(
-            "{width}×{height} 超过 {} 像素上限，未展开",
-            MAX_TEXTURE_PIXELS
-        ));
+        // 降采样而不是丢弃：贴图是 baseColor 的唯一信息来源，丢了模型就是纯白。
+        let (target_w, target_h) = fit_within(width, height, MAX_TEXTURE_EDGE);
+        // 采样核用 `Triangle`（双线性）：8K→4K 上 `Lanczos3` 要多跑数秒，而视口是
+        // sRGB 直读、不做色彩管理，高阶核的锐度收益抵不过「导入一张图卡住十几秒」。
+        rgba = image::imageops::resize(
+            &rgba,
+            target_w,
+            target_h,
+            image::imageops::FilterType::Triangle,
+        );
+        downscaled_from = Some((width, height));
+        width = target_w;
+        height = target_h;
     }
     let _ = texture.width;
+    // 兜底断言：等比缩放后面积必然落在上限内，真越界了说明 `fit_within` 写错了，
+    // 与其把 4K 以上的纹理甩给 GPU 触发校验错，不如在这里就暴露出来。
+    debug_assert!(u64::from(width) * u64::from(height) <= MAX_TEXTURE_PIXELS);
     Ok(TexImage {
         width,
         height,
         rgba: rgba.into_raw(),
+        downscaled_from,
     })
+}
+
+/// 等比缩放到最长边不超过 `edge`，两边至少 1 像素。
+///
+/// 用「四舍五入」而不是向下取整：短边向下取整会让 8191×4097 这类尺寸的比例明显走样。
+/// 取整最多让短边多 0.5 像素，面积仍 ≤ `edge²`（最长边被 `min` 钉死）。
+fn fit_within(width: u32, height: u32, edge: u32) -> (u32, u32) {
+    let longest = width.max(height).max(1);
+    if longest <= edge {
+        return (width.max(1), height.max(1));
+    }
+    let scale = |value: u32| {
+        let scaled = (u64::from(value) * u64::from(edge) + u64::from(longest) / 2)
+            / u64::from(longest);
+        (scaled.max(1).min(u64::from(edge))) as u32
+    };
+    (scale(width), scale(height))
 }
 
 /// 节点世界矩阵 = 父链累乘。`depth` 只是坏 `parent`（自环 / 越界）的保险丝。
@@ -1213,8 +1268,125 @@ mod tests {
         assert!(reason.contains("PNG"), "{reason}");
     }
 
-    // ---- M-UI-4 第二刀：蒙皮 ----
+    /// 超限贴图必须降采样后**继续上传**：Tripo 那批资产的 `baseColorFactor` 是
+    /// (1,1,1,1)，贴图一丢就是纯白模型——降采样只是分辨率打折，不是「看不见」。
+    ///
+    /// debug 下要编解码 64 Mi 像素，跑几分钟；默认只在 release / `--ignored` 时跑。
+    #[test]
+    #[ignore = "debug 下编解码 64 Mi 像素太慢，用 cargo test --release -- --ignored"]
+    fn oversized_texture_is_downscaled_instead_of_dropped() {
+        use image::ImageEncoder as _;
 
+        let (source_w, source_h) = (4096u32, 4097u32);
+        assert!(
+            u64::from(source_w) * u64::from(source_h) > MAX_TEXTURE_PIXELS,
+            "这条测试必须越过像素上限才有意义"
+        );
+        let pixel = [12u8, 34, 56, 255];
+        let raw: Vec<u8> = pixel
+            .iter()
+            .copied()
+            .cycle()
+            .take((source_w * source_h * 4) as usize)
+            .collect();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&raw, source_w, source_h, image::ExtendedColorType::Rgba8)
+            .expect("编码 PNG");
+
+        let image = decode(&png, &AirTexture::default()).expect("超限只该降采样，不该报错");
+        assert_eq!(image.width.max(image.height), MAX_TEXTURE_EDGE);
+        assert!(
+            u64::from(image.width) * u64::from(image.height) <= MAX_TEXTURE_PIXELS,
+            "降采样后仍在像素上限之外：{}×{}",
+            image.width,
+            image.height
+        );
+        assert_eq!(image.downscaled_from, Some((source_w, source_h)));
+        assert_eq!(
+            image.rgba.len() as u64,
+            u64::from(image.width) * u64::from(image.height) * 4
+        );
+        // 抽样确认颜色还在：全白正是缺陷的表征，这里必须不是白色。
+        let probe = &image.rgba[(image.width as usize * 2000 + 2000) * 4..][..4];
+        assert_eq!(probe, pixel, "降采样后像素被清成白色");
+    }
+
+    /// 等比缩放：长边钉在 4096，短边按比例四舍五入；没超限的原样返回。
+    #[test]
+    fn fit_within_keeps_aspect_ratio() {
+        assert_eq!(fit_within(8192, 8192, 4096), (4096, 4096));
+        assert_eq!(fit_within(8000, 4000, 4096), (4096, 2048));
+        assert_eq!(fit_within(1000, 500, 4096), (1000, 500));
+        assert_eq!(fit_within(0, 0, 4096), (1, 1));
+        // 极端长条：短边至少要留 1 像素，塌成 0 会让 wgpu 直接拒绝建纹理。
+        assert_eq!(fit_within(100_000, 3, 4096), (4096, 1));
+    }
+
+    /// 真实 Tripo 资产回归（默认跳过，本机手动跑）：
+    ///
+    /// ```text
+    /// ASSET3D_REAL_GLB=D:\share\sword\ironsword.glb `
+    ///   cargo test --release real_glb -- --ignored --nocapture
+    /// ```
+    ///
+    /// 走完整链路：读文件 → glTF 解析 → AIR（内嵌贴图）→ `merge` → 解码 8192×8192
+    /// baseColor → 降采样 → 绑材质。像素抽样是「有没有变白模」的直接判据。
+    #[test]
+    #[ignore = "需要真实 8K 资产（ASSET3D_REAL_GLB），默认跳过"]
+    fn real_glb_base_color_texture_is_bound_after_downscale() {
+        let path = std::env::var("ASSET3D_REAL_GLB").expect("设置 ASSET3D_REAL_GLB 指向 .glb");
+        // `set VAR=... && ...` 会把尾随空格带进来，路径被拼成 `.glb `，扩展名判定就废了。
+        let path = path.trim().to_string();
+        let scene = load(Path::new(&path)).expect("加载真实资产");
+        let texture = scene.parts[0]
+            .material
+            .texture
+            .as_ref()
+            .expect("baseColor 贴图必须解码成功并绑上材质");
+        assert!(
+            texture.width.max(texture.height) <= MAX_TEXTURE_EDGE,
+            "上传尺寸 {}×{} 超出长边上限",
+            texture.width,
+            texture.height
+        );
+        assert!(texture.downscaled_from.is_some(), "8192×8192 原图必须走降采样");
+
+        // 5×5 均匀抽样：真贴图必然有大量非白像素；整片纯白就是缺陷复现。
+        let (width, height) = (texture.width as usize, texture.height as usize);
+        let mut samples = Vec::new();
+        for gy in 0..5 {
+            for gx in 0..5 {
+                let x = width * (gx * 2 + 1) / 10;
+                let y = height * (gy * 2 + 1) / 10;
+                let at = (y * width + x) * 4;
+                samples.push([texture.rgba[at], texture.rgba[at + 1], texture.rgba[at + 2]]);
+            }
+        }
+        let colored = samples.iter().filter(|px| px.iter().any(|c| *c < 240)).count();
+        println!(
+            "{}: 原图 {:?} → {}×{}，notes={:?}，抽样非白 {}/{}，样本 {:?}",
+            path,
+            texture.downscaled_from,
+            width,
+            height,
+            scene.notes,
+            colored,
+            samples.len(),
+            &samples[..5]
+        );
+        assert!(colored >= 20, "抽样点几乎全白，贴图没真正绑上：{samples:?}");
+        assert!(
+            scene
+                .notes
+                .iter()
+                .any(|note| note.contains("已降采样到")),
+            "notes 必须写清实际降采样尺寸：{:?}",
+            scene.notes
+        );
+    }
+
+    // ---- M-UI-4 第二刀：蒙皮 ----
     use glam::Mat4;
 
     /// 构造一份「一个蒙皮网格 + 一根关节」的文档。关节是根节点，世界矩阵就是

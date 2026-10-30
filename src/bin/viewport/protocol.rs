@@ -98,6 +98,24 @@ pub fn parse(line: &str) -> Result<Request, String> {
     })
 }
 
+/// 取 `open` 帧携带的工作区根（`workspace`，本版**新增**的字段）。
+///
+/// 为什么不把它塞进 [`Request::Open`]：那条分支的字段集是既定契约，往结构体里
+/// 加字段会连带动既有用例的构造字面量一起改；而协议对新增字段的规矩是「老视口
+/// 忽略、老字段语义不变」。所以 `workspace` 单独取：非 `open` 帧、字段缺失、
+/// 类型不对、空串一律 `None`，绝不会影响 [`parse`] 的结果。
+pub fn open_workspace(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("op").and_then(Value::as_str) != Some("open") {
+        return None;
+    }
+    let raw = value.get("workspace").and_then(Value::as_str)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
 /// 握手帧：`ready{version, capabilities}`，`seq=0`（单向）。
 pub fn ready_frame() -> String {
     json!({
@@ -246,5 +264,32 @@ mod tests {
         let idle: Value =
             serde_json::from_str(&state_frame("a.glb", None, 0.0, false, 0.0)).unwrap();
         assert_eq!(idle["duration"], 0.0);
+    }
+
+    /// 新增的 `workspace` 字段：老帧（没有这个字段）必须是 `None`，而不是报错；
+    /// 同时 `parse` 的结果不受影响——这就是「未知字段忽略」的另一面。
+    #[test]
+    fn open_workspace_is_optional_and_harmless() {
+        let legacy = r#"{"v":1,"op":"open","seq":7,"path":"a.glb","play":true}"#;
+        assert_eq!(open_workspace(legacy), None);
+        assert_eq!(
+            parse(legacy).unwrap(),
+            Request::Open {
+                path: "a.glb".to_string(),
+                animation: None,
+                play: true,
+                seq: 7,
+            }
+        );
+
+        let with_ws = r#"{"v":1,"op":"open","seq":8,"path":"a.glb","workspace":"D:/work/ws"}"#;
+        assert_eq!(open_workspace(with_ws).as_deref(), Some("D:/work/ws"));
+        assert!(matches!(parse(with_ws).unwrap(), Request::Open { seq: 8, .. }));
+
+        // 非 open 帧、空串、类型错都不是工作区根。
+        assert_eq!(open_workspace(r#"{"op":"ping","seq":1}"#), None);
+        assert_eq!(open_workspace(r#"{"op":"open","workspace":"  "}"#), None);
+        assert_eq!(open_workspace(r#"{"op":"open","workspace":42}"#), None);
+        assert_eq!(open_workspace("not json"), None);
     }
 }

@@ -20,6 +20,7 @@
 mod air;
 mod air_bin;
 mod command;
+mod export_core;
 mod fbx;
 mod gltf;
 mod pipe;

@@ -47,6 +47,9 @@ const GRID_SHADER: &str = include_str!("grid.wgsl");
 /// 屏幕空间覆盖层（时间轴）：顶点即裁剪空间坐标，不做光照。
 const OVERLAY_SHADER: &str = include_str!("overlay.wgsl");
 
+/// GUI 覆盖层着色器：把 GDI 画好的整屏位图贴回去（见 `ui.wgsl`）。
+const UI_SHADER: &str = include_str!("ui.wgsl");
+
 /// 骨骼线框的颜色：父端偏深、子端偏亮，一条线自带方向感。
 const BONE_COLOR_FROM: [f32; 3] = [1.0, 0.52, 0.16];
 const BONE_COLOR_TO: [f32; 3] = [1.0, 0.82, 0.45];
@@ -132,6 +135,24 @@ struct Timeline {
     visible: bool,
 }
 
+/// GUI 合成层：把一张整屏 RGBA 位图当纹理贴到画面上。
+///
+/// 位图由 `ui::render` 用 GDI 画好（中文文字走 GDI 的 `DrawTextW`），这里只负责
+/// 上传与合成——**没有任何原生控件**，所以不会被 flip model 的交换链盖住。
+struct UiOverlay {
+    pipeline: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
+    layout: wgpu::BindGroupLayout,
+    /// 当前一帧的位图。`None` 表示这帧没有 UI（窗口最小化或还没画过）。
+    frame: Option<UiFrame>,
+}
+
+struct UiFrame {
+    width: u32,
+    height: u32,
+    bind: wgpu::BindGroup,
+}
+
 /// 渲染器。`surface` 用 `'static`：持有一份 `Arc<Window>` 的克隆，
 /// 生命周期与窗口本身一致，比到处传 `&'a Window` 干净。
 pub struct Gfx {
@@ -170,6 +191,8 @@ pub struct Gfx {
     /// 时间轴覆盖层管线与常驻缓冲。
     timeline_pipeline: wgpu::RenderPipeline,
     timeline: Timeline,
+    /// GUI 覆盖层（工具条、面板、状态提示的合成）。
+    ui: UiOverlay,
 }
 
 impl Gfx {
@@ -632,6 +655,83 @@ impl Gfx {
             mapped_at_creation: false,
         });
 
+        // ---- GUI 合成层 ----
+        let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("asset3d-viewport-ui-shader"),
+            source: wgpu::ShaderSource::Wgsl(UI_SHADER.into()),
+        });
+        let ui_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("asset3d-viewport-ui-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("asset3d-viewport-ui-pipeline-layout"),
+            bind_group_layouts: &[&ui_layout],
+            push_constant_ranges: &[],
+        });
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("asset3d-viewport-ui-pipeline"),
+            layout: Some(&ui_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ui_shader,
+                entry_point: "vs_ui",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                // 顶点由着色器按 vertex_index 生成全屏矩形，不需要顶点缓冲。
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader,
+                entry_point: "fs_ui",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // 位图里没有控件的像素 alpha=0，混合后原样透出模型。
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let ui_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("asset3d-viewport-ui-sampler"),
+            // 位图与屏幕像素一一对应：最近邻就够，还能避免 1px 线被插值糊掉。
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
         let grid = reference_grid();
         // 场景侧的顶点是 32 字节的 `Vertex`（带 UV），地板只留位置 + 颜色。
         let packed: Vec<GridVertex> = grid
@@ -677,6 +777,12 @@ impl Gfx {
             timeline: Timeline {
                 buffer: timeline_buffer,
                 visible: false,
+            },
+            ui: UiOverlay {
+                pipeline: ui_pipeline,
+                sampler: ui_sampler,
+                layout: ui_layout,
+                frame: None,
             },
         })
     }
@@ -902,6 +1008,98 @@ impl Gfx {
         self.timeline.visible = true;
     }
 
+    /// 上传一屏 UI 位图（RGBA，尺寸须与窗口物理像素一致）。
+    ///
+    /// 每帧重建纹理而不是 `write_texture` 复用旧纹理：窗口尺寸变了也不用额外处理，
+    /// 而且 UI 只在状态变化时才重画（见 `ViewportApp::refresh_ui`），重建成本摊销后
+    /// 可以忽略。
+    pub fn set_ui_bitmap(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
+            return;
+        }
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("asset3d-viewport-ui"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // 位图是 sRGB 字节（GDI 画的颜色就是屏幕色），用 sRGB 格式采样即可。
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("asset3d-viewport-ui-bind"),
+            layout: &self.ui.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.ui.sampler),
+                },
+            ],
+        });
+        self.ui.frame = Some(UiFrame {
+            width,
+            height,
+            bind,
+        });
+    }
+
+    /// 撤掉 UI 合成层（窗口最小化时没必要再贴一张看不见的图）。
+    pub fn clear_ui(&mut self) {
+        self.ui.frame = None;
+    }
+
+    /// 当前交换链的物理像素尺寸。
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    /// 把屏幕像素坐标映射成时间轴进度。
+    ///
+    /// 时间轴的几何常量就在本文件里（`TIMELINE_*`），所以换算也放这里——否则上层
+    /// 得自己抄一份裁剪坐标公式，写歪了就成了「看得见点不着」。
+    /// 纵向只要落在槽的带高内即可，横向夹到 0..1（拖出两端就等于拖到底）。
+    pub fn timeline_progress_at(&self, x: f32, y: f32) -> Option<f32> {
+        let (width, height) = self.size();
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // 屏幕像素 → 裁剪空间（y 轴朝下，所以要翻）。
+        let nx = x / width as f32 * 2.0 - 1.0;
+        let ny = 1.0 - y / height as f32 * 2.0;
+        if ny < TIMELINE_Y0 || ny > TIMELINE_Y1 {
+            return None;
+        }
+        let progress = (nx - TIMELINE_X0) / (TIMELINE_X1 - TIMELINE_X0);
+        Some(progress.clamp(0.0, 1.0))
+    }
+
     /// 窗口尺寸变化。宽或高归零（最小化）时不重配，留给下一次有效的 resize。
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
@@ -1044,6 +1242,28 @@ impl Gfx {
             pass.set_pipeline(&self.timeline_pipeline);
             pass.set_vertex_buffer(0, self.timeline.buffer.slice(..));
             pass.draw(0..TIMELINE_VERTICES as u32, 0..1);
+        }
+        // GUI 层最后画：工具条要压住一切，包括时间轴与模型。同样 `LoadOp::Load`。
+        // 顶点由 `ui.wgsl` 按 vertex_index 现算（全屏矩形两个三角形 = 6 个顶点）。
+        if let Some(frame) = &self.ui.frame {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("asset3d-viewport-ui-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.ui.pipeline);
+            pass.set_bind_group(0, &frame.bind, &[]);
+            pass.draw(0..6, 0..1);
+            let _ = (frame.width, frame.height);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();

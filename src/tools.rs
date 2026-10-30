@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::air::AirDoc;
 use crate::rpc::{self, Host, HostError};
 use crate::util::{self, Container};
-use crate::{air_bin, view};
+use crate::view;
 
 /// 工具执行失败。`code` 会被原样写进 JSON-RPC error。
 ///
@@ -286,21 +286,18 @@ fn export(host: &Host, args: &Value) -> Result<String, ToolError> {
             Some(raw) => force_extension(host, raw, ".air.bin"),
             None => (default_output(&rel, ".air.bin"), false),
         };
-        let encoded = air_bin::encode(&doc);
-        // 先在内存里回读一遍：布局写错在这里就能发现，而不是等引擎加载到一半才炸。
-        let check = air_bin::decode(&encoded.bytes)
-            .map_err(|err| ToolError::fail(format!("AIRB 自检失败（不会写出坏文件）：{err}")))?;
-        verify(&doc, &check)?;
-        let written = host.write_bytes(&target, &encoded.bytes)?;
+        // 编码 + 回读自检都在 `export_core` 里完成（与视口导出共用同一份实现）。
+        let bytes = crate::export_core::encode_bin(&doc).map_err(ToolError::fail)?;
+        let written = host.write_bytes(&target, &bytes)?;
         let created = written
             .get("created")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         lines.push(format!(
             "  [bin ] {target}｜{}｜{}｜回读一致（结构 + 抽样数值 + AABB 重算）：{} 网格 / {} 顶点 / {} 三角形{}",
-            util::format_bytes(encoded.bytes.len() as u64),
+            util::format_bytes(bytes.len() as u64),
             if created { "新建" } else { "覆盖" },
-            check.meshes.len(),
+            doc.meshes.len(),
             doc.stats.vertex_count,
             doc.stats.triangle_count,
             if renamed { "｜out 后缀已按 format 规范为 .air.bin" } else { "" }
@@ -313,11 +310,7 @@ fn export(host: &Host, args: &Value) -> Result<String, ToolError> {
             Some(raw) => force_extension(host, raw, ".json"),
             None => (default_output(&rel, ".air.json"), false),
         };
-        let text = serde_json::to_string_pretty(&doc)
-            .map_err(|err| ToolError::fail(format!("序列化 JSON 失败：{err}")))?;
-        let check: AirDoc = serde_json::from_str(&text)
-            .map_err(|err| ToolError::fail(format!("AIR JSON 自检失败：{err}")))?;
-        verify(&doc, &check)?;
+        let text = crate::export_core::encode_json(&doc).map_err(ToolError::fail)?;
         let written = host.write_text(&target, &text)?;
         let created = written
             .get("created")
@@ -465,7 +458,7 @@ fn preview(host: &Host, args: &Value) -> Result<String, ToolError> {
     );
     if !outcome.dropped_textures.is_empty() {
         lines.push(format!(
-            "  未内嵌的贴图：{}",
+            "  未内嵌的贴图（只是预览页不内嵌，资产里的贴图还在；预览里显示为材质 baseColor，通常是白色，要看贴图请用 GUI 视口）：{}",
             outcome.dropped_textures.join("、")
         ));
     }
@@ -722,112 +715,10 @@ fn engine_loader(host: &Host, args: &Value) -> Result<String, ToolError> {
 // 引擎加载器模板渲染
 // ---------------------------------------------------------------------------
 
-/// 加载器模板里的四个占位符——全部都要替换，少一个就不许落盘。
-const LOADER_PLACEHOLDERS: [&str; 4] = [
-    "__GENERATED_FROM__",
-    "__GENERATED_AT__",
-    "__AIR_VERSION__",
-    "__AIRB_VERSION__",
-];
-
-/// 渲染 `assets/air_loader.rs.txt`：占位符全量替换 + 残留兜底。
-///
-/// 返回 `Err` 的两种情形都是**模板自身缺陷**，宁可让工具报错，也不要把带
-/// `__XXX__` 的源码写进用户的工程里（那正是本次修掉的 bug）。
+/// 加载器源码渲染委托给 [`crate::export_core::render_loader`]：视口导出用的是
+/// 同一份模板与占位符替换逻辑，这里只做错误类型转换。
 fn render_loader_template() -> Result<String, ToolError> {
-    let template = include_str!("../assets/air_loader.rs.txt");
-    let air_version = crate::air::AIR_VERSION;
-    let airb_version = air_bin::VERSION;
-
-    let mut source = template.to_string();
-    let rendered = [
-        (
-            LOADER_PLACEHOLDERS[0],
-            format!("asset3d 插件 export_engine_loader｜AIR v{air_version} / AIRB v{airb_version}"),
-        ),
-        (LOADER_PLACEHOLDERS[1], utc_timestamp_now()),
-        (LOADER_PLACEHOLDERS[2], air_version.to_string()),
-        (LOADER_PLACEHOLDERS[3], airb_version.to_string()),
-    ];
-    for (token, value) in rendered {
-        source = source.replace(token, &value);
-    }
-
-    if let Some(token) = find_placeholder(&source) {
-        return Err(ToolError::fail(format!(
-            "加载器模板存在未替换的占位符 {token}：请修 assets/air_loader.rs.txt 或 render_loader_template"
-        )));
-    }
-    Ok(source)
-}
-
-/// 在文本里找 `__LIKE_THIS__` 形状的残留占位符。
-///
-/// 只认「`__` + 全大写/数字/下划线 + `__`」，避免把普通文本里的 `__` 误判成占位符。
-fn find_placeholder(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'_' && bytes[i + 1] == b'_' {
-            let start = i;
-            let mut j = i + 2;
-            loop {
-                // 先看是不是闭合的 "__"：位置必须晚于名字的至少一个字符。
-                if j + 1 < bytes.len() && bytes[j] == b'_' && bytes[j + 1] == b'_' {
-                    if j > start + 2 {
-                        return Some(text[start..j + 2].to_string());
-                    }
-                    break;
-                }
-                // 名字段只允许大写字母、数字、下划线。
-                if j >= bytes.len()
-                    || !(bytes[j].is_ascii_uppercase()
-                        || bytes[j].is_ascii_digit()
-                        || bytes[j] == b'_')
-                {
-                    break;
-                }
-                j += 1;
-            }
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
-/// 当前 UTC 时间，格式 `YYYY-MM-DD HH:MM:SS UTC`。
-///
-/// 只为一行注释引入 chrono 不值得，这里直接用 `SystemTime` + 公历换算。
-fn utc_timestamp_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (year, month, day) = civil_from_unix_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
-        rem / 3_600,
-        (rem % 3_600) / 60,
-        rem % 60
-    )
-}
-
-/// Unix 天数 → (年, 月, 日)，Howard Hinnant 的 civil_from_days 算法。
-fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if month <= 2 { y + 1 } else { y }, month, day)
+    crate::export_core::render_loader().map_err(ToolError::fail)
 }
 
 // ---------------------------------------------------------------------------
@@ -880,184 +771,9 @@ fn load(
     Ok((rel, doc))
 }
 
-/// 导出后的回读自检：结构、抽样数值、AABB 重算三层。
-///
-/// 只比长度抓不到「字段布局错位把 x 读成 y」这类错误——长度分毫不差，画面却全歪。
-/// 所以每个网格再抽首/中/末三个顶点逐分量比位置、法线、UV、权重，索引比首尾，
-/// 最后用回读的 positions 重算 AABB 和文件里存的包围盒对照。
-fn verify(expected: &AirDoc, actual: &AirDoc) -> Result<(), ToolError> {
-    if expected.meshes.len() != actual.meshes.len() {
-        return Err(ToolError::fail(format!(
-            "自检失败：网格数 {} → {}",
-            expected.meshes.len(),
-            actual.meshes.len()
-        )));
-    }
-    if expected.nodes.len() != actual.nodes.len()
-        || expected.materials.len() != actual.materials.len()
-        || expected.textures.len() != actual.textures.len()
-        || expected.skins.len() != actual.skins.len()
-        || expected.animations.len() != actual.animations.len()
-    {
-        return Err(ToolError::fail(format!(
-            "自检失败：结构长度不一致（节点 {}→{}、材质 {}→{}、贴图 {}→{}、蒙皮 {}→{}、动画 {}→{}）",
-            expected.nodes.len(),
-            actual.nodes.len(),
-            expected.materials.len(),
-            actual.materials.len(),
-            expected.textures.len(),
-            actual.textures.len(),
-            expected.skins.len(),
-            actual.skins.len(),
-            expected.animations.len(),
-            actual.animations.len()
-        )));
-    }
-    for (i, (a, b)) in expected.meshes.iter().zip(actual.meshes.iter()).enumerate() {
-        if a.positions.len() != b.positions.len() || a.indices.len() != b.indices.len() {
-            return Err(ToolError::fail(format!(
-                "自检失败：网格 #{i} 顶点 {} → {}、索引 {} → {}",
-                a.positions.len(),
-                b.positions.len(),
-                a.indices.len(),
-                b.indices.len()
-            )));
-        }
-        if a.joints.len() != b.joints.len() || a.weights.len() != b.weights.len() {
-            return Err(ToolError::fail(format!(
-                "自检失败：网格 #{i} 的关节/权重长度不一致"
-            )));
-        }
-        // 抽样逐分量比对：首、中、末三个顶点足以抓住整体错位，又不用遍历全量。
-        for probe in sample_indices(a.positions.len()) {
-            // 位置用位模式比：回读必须是逐比特还原，带容差反而会漏掉低位写坏。
-            let same_position = a.positions[probe]
-                .iter()
-                .map(|v| v.to_bits())
-                .eq(b.positions[probe].iter().map(|v| v.to_bits()));
-            if !same_position {
-                return Err(ToolError::fail(format!(
-                    "自检失败：网格 #{i} 顶点 #{probe} 位置不一致 {:?} → {:?}",
-                    a.positions[probe], b.positions[probe]
-                )));
-            }
-            if let (Some(na), Some(nb)) = (a.normals.get(probe), b.normals.get(probe)) {
-                if !approx_eq3(na, nb, 1e-6) {
-                    return Err(ToolError::fail(format!(
-                        "自检失败：网格 #{i} 顶点 #{probe} 法线不一致 {na:?} → {nb:?}"
-                    )));
-                }
-            }
-            if let (Some(ua), Some(ub)) = (a.uvs.get(probe), b.uvs.get(probe)) {
-                if !approx_eq2(ua, ub, 1e-6) {
-                    return Err(ToolError::fail(format!(
-                        "自检失败：网格 #{i} 顶点 #{probe} UV 不一致 {ua:?} → {ub:?}"
-                    )));
-                }
-            }
-            if let (Some(wa), Some(wb)) = (a.weights.get(probe), b.weights.get(probe)) {
-                if !approx_eq4(wa, wb, 1e-5) {
-                    return Err(ToolError::fail(format!(
-                        "自检失败：网格 #{i} 顶点 #{probe} 权重不一致 {wa:?} → {wb:?}"
-                    )));
-                }
-            }
-            if let (Some(ja), Some(jb)) = (a.joints.get(probe), b.joints.get(probe)) {
-                if ja != jb {
-                    return Err(ToolError::fail(format!(
-                        "自检失败：网格 #{i} 顶点 #{probe} 关节索引不一致 {ja:?} → {jb:?}"
-                    )));
-                }
-            }
-        }
-        // 索引比首尾：索引用 `u32` 定长写，错位会直接表现成首尾元素对不上。
-        if a.indices.first() != b.indices.first() || a.indices.last() != b.indices.last() {
-            return Err(ToolError::fail(format!(
-                "自检失败：网格 #{i} 索引首尾不一致 {:?}/{:?} → {:?}/{:?}",
-                a.indices.first(),
-                a.indices.last(),
-                b.indices.first(),
-                b.indices.last()
-            )));
-        }
-        // AABB 重算：包围盒是导出时算好写死的，回读后用顶点重算一遍才能真正对上。
-        let (min, max) = recompute_aabb(&b.positions);
-        if !approx_eq3(&min, &b.aabb_min, 1e-4) || !approx_eq3(&max, &b.aabb_max, 1e-4) {
-            return Err(ToolError::fail(format!(
-                "自检失败：网格 #{i} AABB 与顶点不符（重算 {min:?}~{max:?}，文件存 {:?}~{:?}）",
-                b.aabb_min, b.aabb_max
-            )));
-        }
-    }
-    // 蒙皮：关节表逐项比，IBM 抽首/末两个矩阵（单次导出最多几十根骨，抽检够用）。
-    for (i, (a, b)) in expected.skins.iter().zip(actual.skins.iter()).enumerate() {
-        if a.joints != b.joints {
-            return Err(ToolError::fail(format!(
-                "自检失败：蒙皮 #{i} 关节表不一致（{} → {} 项）",
-                a.joints.len(),
-                b.joints.len()
-            )));
-        }
-        if a.inverse_bind_matrices.len() != b.inverse_bind_matrices.len() {
-            return Err(ToolError::fail(format!(
-                "自检失败：蒙皮 #{i} IBM 数量 {} → {}",
-                a.inverse_bind_matrices.len(),
-                b.inverse_bind_matrices.len()
-            )));
-        }
-        for probe in sample_indices(a.inverse_bind_matrices.len()) {
-            let (ma, mb) = (&a.inverse_bind_matrices[probe], &b.inverse_bind_matrices[probe]);
-            if !approx_eq16(ma, mb, 1e-5) {
-                return Err(ToolError::fail(format!(
-                    "自检失败：蒙皮 #{i} 第 {probe} 个 IBM 不一致 {ma:?} → {mb:?}"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
+/// 回读自检、编码、加载器模板渲染全部在 [`crate::export_core`] 里实现：
+/// 插件工具与视口（asset3d-gui 的导出按键）共用同一份代码，格式只定义一次。
 
-/// 抽样下标：首、中、末（去重后返回，空集返回空）。
-fn sample_indices(len: usize) -> Vec<usize> {
-    match len {
-        0 => Vec::new(),
-        1 => vec![0],
-        2 => vec![0, 1],
-        _ => vec![0, len / 2, len - 1],
-    }
-}
-
-fn approx_eq3(a: &[f32; 3], b: &[f32; 3], tol: f32) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= tol * x.abs().max(1.0))
-}
-
-fn approx_eq2(a: &[f32; 2], b: &[f32; 2], tol: f32) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= tol * x.abs().max(1.0))
-}
-
-fn approx_eq4(a: &[f32; 4], b: &[f32; 4], tol: f32) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= tol * x.abs().max(1.0))
-}
-
-fn approx_eq16(a: &[f32; 16], b: &[f32; 16], tol: f32) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= tol * x.abs().max(1.0))
-}
-
-/// 用顶点重算 AABB；空网格回零盒（与导出侧口径一致）。
-fn recompute_aabb(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
-    if positions.is_empty() {
-        return ([0.0; 3], [0.0; 3]);
-    }
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for p in positions {
-        for axis in 0..3 {
-            min[axis] = min[axis].min(p[axis]);
-            max[axis] = max[axis].max(p[axis]);
-        }
-    }
-    (min, max)
-}
 
 pub fn estimate_binary_bytes(doc: &AirDoc) -> u64 {
     // 逐项对齐 air_bin 的真实落盘布局：容器头 + 每网格的几何段 + 每张内嵌贴图
@@ -1237,6 +953,9 @@ fn is_noise_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::air_bin;
+    use crate::export_core::{civil_from_unix_days, find_placeholder, LOADER_PLACEHOLDERS};
 
     /// 缺陷⑥：估算必须逐项等于落盘布局，而不是"差不多"。
     ///

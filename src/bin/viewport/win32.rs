@@ -22,7 +22,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -360,16 +360,90 @@ struct OpenFileNameW {
 /// 相对路径解析依赖启动目录不变。
 const OFN_FLAGS: u32 = 0x0008_1a08;
 
+/// 保存对话框的旗标：`OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER`。
+///
+/// 与打开对话框的差别只有两处：去掉 `FILEMUSTEXIST`（目标文件本来就不存在），
+/// 加上 `OVERWRITEPROMPT`（覆盖前必须让系统问一句，导出不该静默盖掉同名文件）。
+const OFN_SAVE_FLAGS: u32 = 0x0008_080a;
+
 /// 弹系统「打开文件」对话框，返回用户选中的路径；取消返回 `None`。
+///
+/// `initial_dir` 给初始目录：IDE 托管的视口必须从工作区根起步，否则用户每次都要
+/// 从「我的电脑」翻回去。路径无效时系统会自己退回默认目录，不报错。
 ///
 /// 为什么需要它：无参双击 `asset3d-gui.exe` 时，用户的第一期望是「让我挑个模型」，
 /// 而不是「给我一个空窗口，什么也点不了」。对话框是模态的、会阻塞事件循环——这在
 /// 主线程上可接受：此形态没有宿主在等管道回包（宿主 spawn 一律带 `--pipe`）。
-pub fn pick_asset_file(owner: isize, title: &str, filter: &str) -> Option<PathBuf> {
+pub fn pick_asset_file(
+    owner: isize,
+    title: &str,
+    filter: &str,
+    initial_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    pick_file(
+        owner,
+        title,
+        filter,
+        "glb",
+        "",
+        initial_dir,
+        DialogKind::Open,
+    )
+}
+
+/// 弹系统「保存文件」对话框，返回用户选定的目标路径；取消返回 `None`。
+///
+/// `default_name` 预填文件名（导出 AIR / 加载器时带一个合理的默认名，用户只改目录
+/// 就能确认），`default_ext` 决定用户在文件名里不写扩展名时系统补什么。
+pub fn pick_save_file(
+    owner: isize,
+    title: &str,
+    filter: &str,
+    default_ext: &str,
+    default_name: &str,
+    initial_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    pick_file(
+        owner,
+        title,
+        filter,
+        default_ext,
+        default_name,
+        initial_dir,
+        DialogKind::Save,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DialogKind {
+    Open,
+    Save,
+}
+
+/// 打开 / 保存共用的对话框实现：两者是同一个 `OPENFILENAMEW`，只有旗标与
+/// 调用哪个 API 不同，拆两个函数会把 40 行结构体初始化抄两遍。
+fn pick_file(
+    owner: isize,
+    title: &str,
+    filter: &str,
+    default_ext: &str,
+    default_name: &str,
+    initial_dir: Option<&Path>,
+    kind: DialogKind,
+) -> Option<PathBuf> {
     let mut buffer = vec![0u16; 32 * 1024];
+    // 保存对话框要把「默认文件名」放进同一个缓冲区：系统读它当初始文件名，
+    // 返回时又用它回传用户输入，两件事共用一块内存。
+    if !default_name.is_empty() {
+        let units: Vec<u16> = default_name.encode_utf16().collect();
+        let count = units.len().min(buffer.len() - 1);
+        buffer[..count].copy_from_slice(&units[..count]);
+    }
     let filter = wide(filter);
     let title = wide(title);
-    let default_ext = wide("glb");
+    let default_ext = wide(default_ext);
+    // 目录字符串必须活到 API 返回之后：`ofn.initial_dir` 只是个裸指针。
+    let initial = initial_dir.map(|dir| wide(&dir.to_string_lossy()));
     let mut ofn = OpenFileNameW {
         struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
         owner,
@@ -382,9 +456,16 @@ pub fn pick_asset_file(owner: isize, title: &str, filter: &str) -> Option<PathBu
         max_file: buffer.len() as u32,
         file_title: std::ptr::null_mut(),
         max_file_title: 0,
-        initial_dir: std::ptr::null(),
+        initial_dir: initial
+            .as_ref()
+            .map(|units| units.as_ptr())
+            .unwrap_or(std::ptr::null()),
         title: title.as_ptr(),
-        flags: OFN_FLAGS,
+        flags: if kind == DialogKind::Save {
+            OFN_SAVE_FLAGS
+        } else {
+            OFN_FLAGS
+        },
         file_offset: 0,
         file_extension: 0,
         default_ext: default_ext.as_ptr(),
@@ -395,7 +476,12 @@ pub fn pick_asset_file(owner: isize, title: &str, filter: &str) -> Option<PathBu
         reserved_u32: 0,
         flags_ex: 0,
     };
-    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
+    let ok = if kind == DialogKind::Save {
+        unsafe { GetSaveFileNameW(&mut ofn) }
+    } else {
+        unsafe { GetOpenFileNameW(&mut ofn) }
+    };
+    if ok == 0 {
         // 取消与「对话框打不开」都是 0：两种都当「没选」，不弹错误框打扰。
         return None;
     }
@@ -473,11 +559,13 @@ extern "system" {
     fn CloseHandle(object: isize) -> i32;
 }
 
-// `comdlg32`：只借一个「打开文件」对话框。与上面的 kernel32 分开写 `#[link]`，
-// 因为两者是不同 DLL——合在一个块里会让链接器去 kernel32 找 `GetOpenFileNameW`。
+// `comdlg32`：只借「打开 / 保存文件」两个对话框。与上面的 kernel32 分开写
+// `#[link]`，因为两者是不同 DLL——合在一个块里会让链接器去 kernel32 找
+// `GetOpenFileNameW`。
 #[link(name = "comdlg32")]
 extern "system" {
     fn GetOpenFileNameW(ofn: *mut OpenFileNameW) -> i32;
+    fn GetSaveFileNameW(ofn: *mut OpenFileNameW) -> i32;
 }
 
 /// `MB_OK | MB_ICONERROR | MB_SETFOREGROUND`：置前是必要的——双击启动时窗口刚
