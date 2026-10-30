@@ -53,6 +53,8 @@ const UI_SHADER: &str = include_str!("ui.wgsl");
 /// 骨骼线框的颜色：父端偏深、子端偏亮，一条线自带方向感。
 const BONE_COLOR_FROM: [f32; 3] = [1.0, 0.52, 0.16];
 const BONE_COLOR_TO: [f32; 3] = [1.0, 0.82, 0.45];
+/// 关节标记的颜色：比骨头更亮一档，一眼能分出「端点」和「连线」。
+const BONE_JOINT_COLOR: [f32; 3] = [1.0, 0.96, 0.78];
 
 /// 时间轴的几何（裁剪空间）：底部一条细长槽，进度从左往右填。
 const TIMELINE_Y0: f32 = -0.975;
@@ -125,7 +127,10 @@ struct SkeletonLines {
     buffer: wgpu::Buffer,
     /// 每根线两端在矩阵表里的槽位。
     lines: Vec<[u16; 2]>,
-    /// 顶点容量（= lines.len() × 2）。
+    /// 关节标记（十字）的半长，世界单位。载入时按骨架尺寸定一次，之后不再改：
+    /// 每帧按当前姿态重算会让标记在播动画时大小抖动。
+    marker: f32,
+    /// 顶点容量（= lines.len() × 2 + 关节数 × 6）。每帧写回前必须核对。
     capacity: usize,
 }
 
@@ -932,7 +937,9 @@ impl Gfx {
             self.skeleton = None;
             return;
         }
-        let vertices = skeleton_vertices(lines, points);
+        // 标记尺寸跟骨架大小成比例：按模型量级取，不然大模型看不清、小模型糊一片。
+        let marker = joint_marker_size(points);
+        let vertices = skeleton_vertices(lines, points, marker);
         let capacity = vertices.len();
         let buffer = self
             .device
@@ -944,6 +951,7 @@ impl Gfx {
         self.skeleton = Some(SkeletonLines {
             buffer,
             lines: lines.to_vec(),
+            marker,
             capacity,
         });
     }
@@ -965,12 +973,12 @@ impl Gfx {
             .write_buffer(&scene.bone_buffer, 0, bytemuck::cast_slice(matrices));
     }
 
-    /// 每帧改写骨骼端点。槽位越界的线退化成一个点（画不出来），不会顺延错位。
+    /// 每帧改写骨骼端点与关节标记。槽位越界的线退化成一个点（画不出来），不会顺延错位。
     pub fn update_skeleton(&mut self, points: &[Vec3]) {
         let Some(skeleton) = &mut self.skeleton else {
             return;
         };
-        let vertices = skeleton_vertices(&skeleton.lines, points);
+        let vertices = skeleton_vertices(&skeleton.lines, points, skeleton.marker);
         if vertices.len() != skeleton.capacity {
             return;
         }
@@ -1271,10 +1279,16 @@ impl Gfx {
     }
 }
 
-/// 把「关节槽位对」铺成 LineList 顶点。槽位越界的线两端都落在原点（退化），
-/// 而不是顺延去取下一根——那样画面上的连线会整体错位，比不画更误导。
-fn skeleton_vertices(lines: &[[u16; 2]], points: &[Vec3]) -> Vec<GridVertex> {
-    let mut vertices = Vec::with_capacity(lines.len() * 2);
+/// 把「关节槽位对」铺成 LineList 顶点，再给每个关节补一个三轴十字标记。
+///
+/// 槽位越界的线两端都落在原点（退化），而不是顺延去取下一根——那样画面上的连线
+/// 会整体错位，比不画更误导。
+///
+/// 顶点排布固定为「先全部连线，再全部标记」：调用方每帧按同样的顺序重算，长度
+/// 只由 `lines.len()` 与 `points.len()` 决定，所以缓冲能复用；关节数变了长度就
+/// 对不上，调用方据此跳过写回，不会把旧缓冲写串。
+fn skeleton_vertices(lines: &[[u16; 2]], points: &[Vec3], marker: f32) -> Vec<GridVertex> {
+    let mut vertices = Vec::with_capacity(lines.len() * 2 + points.len() * 6);
     for [from, to] in lines {
         let from = points.get(*from as usize).copied().unwrap_or(Vec3::ZERO);
         let to = points.get(*to as usize).copied().unwrap_or(Vec3::ZERO);
@@ -1287,7 +1301,54 @@ fn skeleton_vertices(lines: &[[u16; 2]], points: &[Vec3]) -> Vec<GridVertex> {
             color: BONE_COLOR_TO,
         });
     }
+    // 关节标记：每个关节画 X / Y / Z 三段短线组成的十字。用线而不是实心球，
+    // 是因为这条管线只有 LineList 拓扑，而十字已经足够在地板上看出「这里有个关节」。
+    let half = marker.max(0.0);
+    if half > 0.0 {
+        for point in points {
+            // 非有限坐标退到原点而不是跳过：标记数必须与关节数严格对应，否则
+            // 每帧顶点数会随姿态变化，缓冲容量对不上就只能整段不更新。
+            let point = if point.is_finite() { *point } else { Vec3::ZERO };
+            for axis in 0..3 {
+                let mut offset = Vec3::ZERO;
+                offset[axis] = half;
+                vertices.push(GridVertex {
+                    pos: (point - offset).to_array(),
+                    color: BONE_JOINT_COLOR,
+                });
+                vertices.push(GridVertex {
+                    pos: (point + offset).to_array(),
+                    color: BONE_JOINT_COLOR,
+                });
+            }
+        }
+    }
     vertices
+}
+
+/// 关节十字的半长：按骨架包围盒最大边长取 3%，并给一个下限，免得退化骨架
+/// （所有关节重合）把标记画成看不见的点。
+fn joint_marker_size(points: &[Vec3]) -> f32 {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut seen = false;
+    for point in points {
+        if !point.is_finite() {
+            continue;
+        }
+        min = min.min(*point);
+        max = max.max(*point);
+        seen = true;
+    }
+    if !seen {
+        return 0.02;
+    }
+    let extent = (max - min).max_element();
+    if !extent.is_finite() || extent <= 1e-6 {
+        0.02
+    } else {
+        extent * 0.03
+    }
 }
 
 /// 屏幕空间的一块矩形（两个三角形）。`alpha` 借用位置向量的 z 分量传进着色器。
@@ -1401,4 +1462,54 @@ fn create_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> w
 /// 一片格子的位置，否则屏幕上只有两条贴在脸上的线，看起来比清屏还像没启动。
 pub fn idle_camera() -> Orbit {
     Orbit::fit(glam::Vec3::new(0.0, 0.8, 0.0), 6.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tuned(bones: &[[u16; 2]], joints: &[Vec3]) -> (Vec<GridVertex>, f32) {
+        let marker = joint_marker_size(joints);
+        (skeleton_vertices(bones, joints, marker), marker)
+    }
+
+    /// 顶点数必须是「线数×2 + 关节数×6」，否则每帧重算会和建缓冲时的容量对不上，
+    /// `update_skeleton` 会整段拒绝写回（骨架就永远停在载入姿态）。
+    #[test]
+    fn skeleton_vertices_keep_a_stable_vertex_count() {
+        let joints = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)];
+        let (vertices, marker) = tuned(&[[0, 1]], &joints);
+        assert_eq!(vertices.len(), 2 + 2 * 6);
+        assert!(marker > 0.0);
+
+        // 关节翻倍只加标记，不改每根线的顶点数。
+        let joints = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.3, 1.0, 0.0),
+        ];
+        let (vertices, _) = tuned(&[[0, 1], [1, 2]], &joints);
+        assert_eq!(vertices.len(), 2 * 2 + 3 * 6);
+    }
+
+    /// 越界槽位与坏坐标都不能改变顶点数：前者退到原点，后者退到原点但不跳过。
+    #[test]
+    fn skeleton_vertices_degrade_without_changing_counts() {
+        let joints = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(f32::NAN, 0.0, 0.0)];
+        let (vertices, _) = tuned(&[[0, 9]], &joints);
+        assert_eq!(vertices.len(), 2 + 2 * 6);
+        for vertex in &vertices {
+            assert!(vertex.pos.iter().all(|value| value.is_finite()));
+        }
+    }
+
+    /// 标记尺寸跟骨架量级走：大骨架看得见，退化骨架（所有关节重合）也不能缩成 0。
+    #[test]
+    fn joint_marker_follows_skeleton_extent() {
+        let small = [Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0)];
+        let large = [Vec3::ZERO, Vec3::new(0.0, 100.0, 0.0)];
+        assert!(joint_marker_size(&large) > joint_marker_size(&small));
+        assert!(joint_marker_size(&[Vec3::ZERO, Vec3::ZERO]) > 0.0);
+        assert!(joint_marker_size(&[]) > 0.0);
+    }
 }

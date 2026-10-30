@@ -246,6 +246,80 @@ impl SelfTest {
     }
 }
 
+/// 播放截帧形态：`ASSET3D_POSE_SHOT=<glb>`。
+///
+/// 存在的理由只有一个——重定向出来的动画「能不能播、姿态对不对」必须有画面证据，
+/// 而不是「窗口开了」就算通过。载入资产后依次把播放头停到给定时间比例处，
+/// 每处等三帧再抓客户区截图，抓完写清单退出。留三帧是因为载入后的第一次
+/// present 可能还没进合成器，抓早了会拿到一张纯背景的图。
+struct PoseShots {
+    dir: PathBuf,
+    /// 停靠点：`(标签, 时长比例)`。
+    stops: Vec<(String, f32)>,
+    /// 当前停到第几个。
+    at: usize,
+    /// 0 = 待设时刻，1 = 已设时刻等首帧，2 = 再等一帧，>=3 = 可以抓了。
+    settle: u8,
+    /// 已抓到的证据。
+    shots: Vec<(String, PathBuf, u32, u32, String)>,
+    /// 首次抓帧只当热身：载入后的第一张 present 还没进合成器，抓到的是一张空背景。
+    warmed: bool,
+}
+
+impl PoseShots {
+    /// 没设 `ASSET3D_POSE_SHOT` 就返回 `None`，正常看图流程完全不受影响。
+    fn from_env() -> Option<PoseShots> {
+        let flag = std::env::var("ASSET3D_POSE_SHOT").unwrap_or_default();
+        if flag.is_empty() || flag == "0" {
+            return None;
+        }
+        let dir = std::env::var_os("ASSET3D_POSE_SHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("asset3d-pose-shots"));
+        // 写法：`0,0.5,1` 或 `start:0,mid:0.5,end:1`。
+        let raw = std::env::var("ASSET3D_POSE_SHOT_AT")
+            .unwrap_or_else(|_| "0,0.5,1".to_string());
+        let mut stops = Vec::new();
+        for item in raw.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (label, value) = match item.split_once(':') {
+                Some((label, value)) => (label.trim().to_string(), value.trim()),
+                None => (format!("{item}"), item),
+            };
+            let Ok(ratio) = value.parse::<f32>() else {
+                eprintln!("asset3d-gui: ASSET3D_POSE_SHOT_AT 里的 `{item}` 不是数字，忽略");
+                continue;
+            };
+            let label = label.replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-', "_");
+            stops.push((label, ratio.clamp(0.0, 1.0)));
+        }
+        if stops.is_empty() {
+            stops.push(("0".to_string(), 0.0));
+        }
+        Some(PoseShots {
+            dir,
+            stops,
+            at: 0,
+            settle: 0,
+            shots: Vec::new(),
+            warmed: false,
+        })
+    }
+}
+
+/// 启动时是否直接打开骨架：`ASSET3D_SHOW_BONES=1`。
+///
+/// 只为「截帧验证骨架画得对不对」服务——正常看图一律默认关，靠按钮或 B 键切换。
+fn bones_from_env() -> bool {
+    matches!(
+        std::env::var("ASSET3D_SHOW_BONES").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
 /// 白模审计的报告落点：`ASSET3D_ASSET_AUDIT_REPORT` 优先，否则落系统临时目录
 /// （带时间戳目录，多轮复跑不互相覆盖）。
 fn audit_report_path(root: &Path) -> PathBuf {
@@ -300,6 +374,8 @@ fn main() {
 
     // 无头导出自测的开关先读：它决定下面要不要抢互斥体（自测要能连着跑）。
     let selftest = SelfTest::from_env();
+    // 播放截帧同理：连着跑同一资产时要绕开「已有实例」的置前逻辑。
+    let pose_shots = PoseShots::from_env();
 
     // 互斥体：托管形态不抢——同一条管道最多一个实例由宿主判（管道已存在就直接连接），
     // 抢了反而会让「IDE 起的视口」和「用户双击的视口」互相打死。
@@ -325,13 +401,21 @@ fn main() {
         //
         // 自测实例给名字加一次性后缀：否则上一轮（还没退干净）的窗口会把这一轮
         // 直接挡回去，验证就成了「什么都不做也算通过」。
-        let key = match &selftest {
-            Some(selftest) => format!(
+        let key = match (&selftest, &pose_shots) {
+            (Some(selftest), _) => format!(
                 "{}.standalone.selftest.{:x}",
                 win32::INSTANCE_MUTEX,
                 selftest.nonce
             ),
-            None => format!(
+            (None, Some(_)) => format!(
+                "{}.standalone.shot.{:x}",
+                win32::INSTANCE_MUTEX,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos() as u64)
+                    .unwrap_or(0)
+            ),
+            (None, None) => format!(
                 "{}.standalone.{:016x}",
                 win32::INSTANCE_MUTEX,
                 hash_path(asset)
@@ -400,7 +484,7 @@ fn main() {
         time: 0.0,
         playing: false,
         looping: true,
-        show_bones: false,
+        show_bones: bones_from_env(),
         last_tick: None,
         title_accum: 0.0,
         host_workspace: None,
@@ -419,6 +503,7 @@ fn main() {
         timeline_drag: false,
         ui_dirty: true,
         selftest,
+        pose_shots,
     };
     // 自测驱动另起一条线程：只按节拍投递「下一步」，不碰任何窗口状态。
     // 走事件而不是在事件循环里连跑，是为了每步之间真的过一遍 `RedrawRequested`，
@@ -539,6 +624,8 @@ struct ViewportApp {
     ui_dirty: bool,
     /// 无头导出自测的状态：`ASSET3D_GUI_SELFTEST` 没设就是 `None`，正常运行
     /// 一条分支都不会多走。
+    /// 播放截帧形态的状态：`ASSET3D_POSE_SHOT` 没设就是 `None`。
+    pose_shots: Option<PoseShots>,
     selftest: Option<SelfTest>,
 }
 
@@ -651,9 +738,11 @@ impl ViewportApp {
         if let Some(rig) = &self.rig {
             if rig.animation_count() > 0 {
                 eprintln!(
-                    "asset3d-gui: {}，骨骼线框 {} 条",
+                    "asset3d-gui: {}，骨骼线框 {} 条 / {} 个关节（当前{}）",
                     rig.animation_summary(),
-                    rig.bone_lines().len()
+                    rig.bone_lines().len(),
+                    rig.joint_points().len(),
+                    if self.show_bones { "显示" } else { "隐藏" }
                 );
             } else if !rig.bone_lines().is_empty() {
                 eprintln!(
@@ -846,6 +935,17 @@ impl ViewportApp {
             "asset3d-gui: 骨骼线框{}",
             if self.show_bones { "开" } else { "关" }
         );
+        // 没有骨架的资产（纯静态网格）打开开关也看不到任何线：说清原因，别让
+        // 用户对着「骨骼：开」的按钮怀疑是不是坏了。
+        let has_bones = self
+            .rig
+            .as_ref()
+            .map(|rig| !rig.bone_lines().is_empty())
+            .unwrap_or(false);
+        if self.show_bones && !has_bones {
+            self.set_status("当前资产没有骨骼，显示不出骨架", true);
+            return;
+        }
         self.refresh_view();
     }
 
@@ -995,6 +1095,7 @@ impl ViewportApp {
             ui::ButtonId::Loop => self.toggle_loop(),
             ui::ButtonId::PrevAnim => self.step_animation(-1),
             ui::ButtonId::NextAnim => self.step_animation(1),
+            ui::ButtonId::Bones => self.toggle_bones(),
             ui::ButtonId::Panel => self.toggle_panel(),
             ui::ButtonId::ExportAir => {
                 // 没有资产时导出菜单没有意义：直接提示，免得用户选了格式才发现没源。
@@ -1719,6 +1820,7 @@ impl ViewportApp {
             scale,
             playing: self.playing,
             looping: self.looping,
+            show_bones: self.show_bones,
             has_asset: self.current.is_some(),
             panel: ui::PanelView {
                 open: self.panel_open,
@@ -2009,6 +2111,155 @@ impl ViewportApp {
         }
     }
 
+    /// 推进一步播放截帧流程。
+    ///
+    /// 节奏是「设播放头 → 等两帧 → 抓图 → 下一个停靠点」：第一帧可能还在合成 UI
+    /// 位图，只等一帧容易抓到上一姿态。窗口 / 骨架没就绪时直接返回，等下一次
+    /// `about_to_wait` 再来。
+    fn drive_pose_shots(&mut self) {
+        if self.window.is_none() || self.rig.is_none() {
+            return;
+        }
+        let Some((at, settle, total)) = self
+            .pose_shots
+            .as_ref()
+            .map(|shots| (shots.at, shots.settle, shots.stops.len()))
+        else {
+            return;
+        };
+        if at >= total {
+            self.finish_pose_shots();
+            return;
+        }
+        let (label, ratio) = match self.pose_shots.as_ref() {
+            Some(shots) => shots.stops[at].clone(),
+            None => return,
+        };
+        match settle {
+            0 => {
+                let duration = self.duration();
+                self.time = (duration * ratio).clamp(0.0, duration);
+                self.playing = false;
+                self.last_tick = None;
+                self.refresh_view();
+                if let Some(shots) = self.pose_shots.as_mut() {
+                    shots.settle = 1;
+                }
+            }
+            1 => {
+                self.redraw();
+                if let Some(shots) = self.pose_shots.as_mut() {
+                    shots.settle = 2;
+                }
+            }
+            2 => {
+                self.redraw();
+                if let Some(shots) = self.pose_shots.as_mut() {
+                    shots.settle = 3;
+                }
+            }
+            _ => {
+                // 热身轮什么都没抓，这一停靠点必须重来：at 不能往前走。
+                if self.capture_pose_shot(&label, at) {
+                    if let Some(shots) = self.pose_shots.as_mut() {
+                        shots.at = at + 1;
+                        shots.settle = 0;
+                    }
+                } else if let Some(shots) = self.pose_shots.as_mut() {
+                    shots.settle = 0;
+                }
+            }
+        }
+    }
+
+    /// 抓一张当前姿态的客户区截图，结果记进 `pose_shots.shots`。
+    fn capture_pose_shot(&mut self, label: &str, index: usize) -> bool {
+        let Some(dir) = self.pose_shots.as_ref().map(|shots| shots.dir.clone()) else {
+            return true;
+        };
+        if !self.pose_shots.as_ref().map(|shots| shots.warmed).unwrap_or(false) {
+            // 热身轮：丢掉这一张，回到本次停靠点重走「设时刻 → 等三帧 → 抓帧」。
+            if let Some(shots) = self.pose_shots.as_mut() {
+                shots.warmed = true;
+                shots.settle = 0;
+            }
+            return false;
+        }
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            eprintln!("asset3d-gui: 截帧目录建不出来（{}）：{err}", dir.display());
+            self.pose_shots.as_mut().map(|shots| shots.at = usize::MAX);
+            return true;
+        }
+        let path = dir.join(format!("{index:02}-{label}.png"));
+        let Some(window) = self.window.as_ref() else {
+            return true;
+        };
+        let hwnd = hwnd_of(window);
+        match viewport::shot::capture_client(hwnd, &path) {
+            Ok(shot) => {
+                let (width, height, method) = (shot.width, shot.height, shot.method.to_string());
+                eprintln!(
+                    "asset3d-gui: 截帧 {label} t={:.3}s → {}（{width}×{height} via {method}）",
+                    self.time,
+                    path.display()
+                );
+                if let Some(shots) = self.pose_shots.as_mut() {
+                    shots
+                        .shots
+                        .push((label.to_string(), path, width, height, method));
+                }
+            }
+            Err(err) => {
+                eprintln!("asset3d-gui: 截帧 {label} 失败：{err}");
+                if let Some(shots) = self.pose_shots.as_mut() {
+                    // 用 MAX 标记失败：收尾时据此把退出码定成 2。
+                    shots.at = usize::MAX;
+                }
+            }
+        }
+        true
+    }
+
+    /// 收尾：把截帧清单写成 JSON，非全绿则退出码 2。
+    fn finish_pose_shots(&mut self) {
+        let Some(shots) = self.pose_shots.as_ref() else {
+            return;
+        };
+        let dir = shots.dir.clone();
+        let asset = self.current.clone().unwrap_or_default();
+        let animation = self.animation_name.clone().unwrap_or_default();
+        let duration = self.duration();
+        let failed = shots.at == usize::MAX;
+        let list = shots.shots.clone();
+        let mut json = String::from("{\n");
+        json.push_str(&format!(
+            "  \"asset\": \"{}\",\n  \"animation\": \"{}\",\n  \"duration\": {:.4},\n",
+            asset.replace('\\', "\\\\"),
+            animation.replace('"', "'"),
+            duration
+        ));
+        json.push_str("  \"shots\": [\n");
+        for (i, (label, path, width, height, method)) in list.iter().enumerate() {
+            json.push_str(&format!(
+                "    {{\"label\": \"{label}\", \"path\": \"{}\", \"width\": {width}, \"height\": {height}, \"method\": \"{method}\"}}{}\n",
+                path.to_string_lossy().replace('\\', "\\\\"),
+                if i + 1 == list.len() { "" } else { "," }
+            ));
+        }
+        json.push_str("  ]\n}\n");
+        let report = dir.join("pose-shots.json");
+        if let Err(err) = std::fs::write(&report, json) {
+            eprintln!("asset3d-gui: 截帧清单写不出（{}）：{err}", report.display());
+        }
+        eprintln!(
+            "asset3d-gui: 截帧完成，{} 张，清单 {}",
+            list.len(),
+            report.display()
+        );
+        std::process::exit(if failed { 2 } else { 0 });
+    }
+
+    /// 请求重绘一次。窗口还没建好时是空操作。
     fn redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -2273,6 +2524,11 @@ impl ApplicationHandler<UserEvent> for ViewportApp {
     /// 只要还在播就推进一步并 `request_redraw`，重绘完又回到这里，形成闭环。
     /// 暂停后返回 `false`，GPU 立刻停下来——静止画面不烧显卡。
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.pose_shots.is_some() {
+            // 截帧形态自己控制播放头，播放泵必须停：让它自动前进就抓不到指定时刻。
+            self.drive_pose_shots();
+            return;
+        }
         if self.advance(Instant::now()) {
             self.redraw();
         }

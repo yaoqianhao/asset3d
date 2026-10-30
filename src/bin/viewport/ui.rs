@@ -45,18 +45,21 @@ pub enum ButtonId {
     Loop,
     PrevAnim,
     NextAnim,
+    /// 骨骼线框开关（默认关，按下后画骨架）。
+    Bones,
     Panel,
     ExportAir,
     ExportLoader,
 }
 
 impl ButtonId {
-    pub const ALL: [ButtonId; 8] = [
+    pub const ALL: [ButtonId; 9] = [
         ButtonId::Import,
         ButtonId::Play,
         ButtonId::Loop,
         ButtonId::PrevAnim,
         ButtonId::NextAnim,
+        ButtonId::Bones,
         ButtonId::Panel,
         ButtonId::ExportAir,
         ButtonId::ExportLoader,
@@ -91,6 +94,8 @@ pub struct LayoutInput<'a> {
     pub scale: f32,
     pub playing: bool,
     pub looping: bool,
+    /// 骨骼线框当前是否可见：按钮文字与高亮都读它。
+    pub show_bones: bool,
     pub has_asset: bool,
     pub panel: PanelView<'a>,
     pub popup: bool,
@@ -170,6 +175,14 @@ fn label_of(id: ButtonId, input: &LayoutInput) -> &'static str {
         }
         ButtonId::PrevAnim => "上一动画",
         ButtonId::NextAnim => "下一动画",
+        ButtonId::Bones => {
+            // 文字直接说「现在是什么状态」，不用再去猜高亮色代表开还是关。
+            if input.show_bones {
+                "骨骼：开"
+            } else {
+                "骨骼：关"
+            }
+        }
         ButtonId::Panel => {
             if input.panel.open {
                 "目录 ▲"
@@ -667,7 +680,7 @@ pub fn render(input: &LayoutInput, layout: &Layout) -> Option<(u32, u32, Vec<u8>
     for (id, rect, text) in &layout.buttons {
         let pressed = layout.pressed == Some(Hit::Button(*id));
         let hovered = layout.hover == Some(Hit::Button(*id));
-        let accent = *id == ButtonId::Import;
+        let accent = *id == ButtonId::Import || (*id == ButtonId::Bones && input.show_bones);
         let background = if pressed {
             BTN_PRESS
         } else if hovered {
@@ -909,6 +922,7 @@ mod tests {
             scale: 1.0,
             playing: false,
             looping: true,
+            show_bones: false,
             has_asset: true,
             panel: PanelView {
                 open: panel_open,
@@ -1011,6 +1025,49 @@ mod tests {
         assert_eq!(label(ButtonId::Play), "暂停");
         assert_eq!(label(ButtonId::Loop), "循环：关");
         assert_eq!(label(ButtonId::Panel), "目录 ▲");
+        assert_eq!(label(ButtonId::Bones), "骨骼：关");
+    }
+
+    /// 骨骼按钮：默认「关」（骨架默认不画），点一下切成「开」，且命中矩形落在
+    /// 工具条内、与其它按钮不重叠。
+    #[test]
+    fn bones_button_starts_hidden_and_toggles_label() {
+        let names = labels(0);
+        let off = sample(&names, false);
+        assert!(!off.show_bones, "骨架默认必须是隐藏的");
+        let off_layout = Layout::compute(&off);
+        let bones = off_layout
+            .buttons
+            .iter()
+            .find(|(id, _, _)| *id == ButtonId::Bones)
+            .map(|(_, rect, text)| (*rect, text.clone()))
+            .expect("工具条上必须有骨骼按钮");
+        assert_eq!(bones.1, "骨骼：关");
+        assert!(bones.0.y + bones.0.h <= off_layout.toolbar.h);
+        assert_eq!(
+            off_layout.hit(bones.0.x + 3.0, bones.0.y + 3.0),
+            Some(Hit::Button(ButtonId::Bones))
+        );
+
+        let mut on = sample(&names, false);
+        on.show_bones = true;
+        let on_layout = Layout::compute(&on);
+        let label = on_layout
+            .buttons
+            .iter()
+            .find(|(id, _, _)| *id == ButtonId::Bones)
+            .map(|(_, _, text)| text.clone())
+            .unwrap();
+        assert_eq!(label, "骨骼：开");
+        // 开关只改文字、不改宽度：文字长度相同，布局矩形必须一模一样，否则每次
+        // 切换整条工具条都会横向抖一下。
+        let on_rect = on_layout
+            .buttons
+            .iter()
+            .find(|(id, _, _)| *id == ButtonId::Bones)
+            .map(|(_, rect, _)| *rect)
+            .unwrap();
+        assert_eq!(on_rect, bones.0);
     }
 
     #[test]
