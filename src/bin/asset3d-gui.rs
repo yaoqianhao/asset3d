@@ -52,6 +52,9 @@ mod fbx;
 #[path = "../gltf.rs"]
 #[allow(dead_code)]
 mod gltf;
+#[path = "../vrm.rs"]
+#[allow(dead_code)]
+mod vrm;
 #[path = "../util.rs"]
 #[allow(dead_code)]
 mod util;
@@ -98,7 +101,7 @@ const DEFAULT_SIZE: (f64, f64) = (1100.0, 720.0);
 const TITLE_IDLE: &str = "asset3d 视口（拖入模型，或按 O 打开）";
 
 /// 文件对话框的过滤器串。`\0` 分隔：说明 + 通配，双 `\0` 收尾（Win32 约定）。
-const ASSET_FILTER: &str = "3D 资产 (*.glb;*.gltf;*.fbx)\0*.glb;*.gltf;*.fbx\0所有文件 (*.*)\0*.*\0";
+const ASSET_FILTER: &str = "3D 资产 (*.glb;*.gltf;*.vrm;*.fbx)\0*.glb;*.gltf;*.vrm;*.fbx\0所有文件 (*.*)\0*.*\0";
 
 /// 导出对话框的过滤器。AIR 二进制用 `.air.bin`（双扩展名，插件侧同一口径），
 /// 所以通配写 `*.bin` 而不是 `*.air.bin`——Win32 的通配只匹配最后一段。
@@ -2584,10 +2587,10 @@ fn hash_path(path: &Path) -> u64 {
     hash
 }
 
-/// 裸路径参数是否像个 3D 资产：`ASSET_FILTER` 里认的三种扩展名，忽略大小写。
+/// 裸路径参数是否像个 3D 资产：`ASSET_FILTER` 里认的四种扩展名，忽略大小写。
 fn is_asset_path(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    [".glb", ".gltf", ".fbx"]
+    [".glb", ".gltf", ".vrm", ".fbx"]
         .iter()
         .any(|ext| lower.ends_with(ext))
 }

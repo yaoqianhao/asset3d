@@ -340,6 +340,7 @@ def prepare_fixtures() -> None:
     import make_glb_fixture
     import make_huge_fixture
     import make_skin_fixture
+    import make_vrm_fixture
 
     make_fixture.main()
     make_fbx_fixture.main()
@@ -353,6 +354,9 @@ def prepare_fixtures() -> None:
     make_big_fixture.main()
     # 超大夹具（1.04 MiB / 2.87 MiB）：0.2.0 的 720 KiB 上限正好卡在它们之间。
     make_huge_fixture.main()
+    # VRM 夹具（1.0 存成 .vrm、0.x 存成 .glb）：VRM 就是 GLB，几何与 cube 同源，
+    # 差异只在扩展块；两者都要能导入，且 0.x 那个不能因为扩展名是 .glb 就漏判。
+    make_vrm_fixture.main()
 
 
 def run_paged(failures: list[str]) -> None:

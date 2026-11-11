@@ -64,7 +64,7 @@ pub fn catalog() -> Value {
     json!([
         {
             "name": "inspect_asset",
-            "description": "解析工作区内的 .fbx / .glb / .gltf 三维资产，输出 AIR 摘要（网格、材质、贴图、骨骼、动画、包围盒）与导入期问题清单。只读，不写盘。",
+            "description": "解析工作区内的 .fbx / .glb / .gltf / .vrm 三维资产，输出 AIR 摘要（网格、材质、贴图、骨骼、动画、包围盒）与导入期问题清单。VRM（0.x / 1.0）按其 GLB 容器解析，并在摘要中标注 VRM 版本、humanoid 骨映射与 MToon 材质等情况。只读，不写盘。",
             "risk": "read",
             "parameters": {
                 "type": "object",
@@ -88,7 +88,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "export_asset",
-            "description": "把 .fbx / .glb / .gltf 导入成引擎内核可直接消费的 AIR：导出 .air.bin（AIRB 二进制，几何平铺可直灌顶点缓冲）或 .air.json（便于 diff 与手改）。写盘后立即回读校验。",
+            "description": "把 .fbx / .glb / .gltf / .vrm 导入成引擎内核可直接消费的 AIR：导出 .air.bin（AIRB 二进制，几何平铺可直灌顶点缓冲）或 .air.json（便于 diff 与手改）。写盘后立即回读校验。VRM 的 toon 光照 / 描边 / 表情 / 摆裙等专有内容不支持，会以问题清单形式降级说明，不影响导入。",
             "risk": "write",
             "parameters": {
                 "type": "object",
@@ -146,7 +146,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "list_assets",
-            "description": "递归扫描工作区目录，列出所有 .fbx / .glb / .gltf 资产及体积，便于批量导入前先摸清家底。",
+            "description": "递归扫描工作区目录，列出所有 .fbx / .glb / .gltf / .vrm 资产及体积，便于批量导入前先摸清家底。",
             "risk": "read",
             "parameters": {
                 "type": "object",
@@ -569,6 +569,9 @@ fn list(host: &Host, args: &Value) -> Result<String, ToolError> {
             util::format_bytes(*size),
             if path.to_lowercase().ends_with(".fbx") {
                 "FBX"
+            } else if path.to_lowercase().ends_with(".vrm") {
+                // 容器是 GLB，但清单里单独标 VRM：用户看到「glTF」会以为扩展名被吞了。
+                "VRM"
             } else {
                 "glTF"
             }
@@ -576,7 +579,7 @@ fn list(host: &Host, args: &Value) -> Result<String, ToolError> {
     }
     out.push_str(&format!("合计 {}\n", util::format_bytes(total)));
     if files.is_empty() {
-        out.push_str("没有找到 .fbx / .glb / .gltf。\n");
+        out.push_str("没有找到 .fbx / .glb / .gltf / .vrm。\n");
     }
     if !unreadable.is_empty() {
         out.push_str(&format!(
@@ -749,7 +752,8 @@ fn load(
             crate::fbx::import(&mut doc, &bytes, &rel, animations, embed_textures)
                 .map_err(ToolError::fail)?;
         }
-        Container::Glb | Container::Gltf => {
+        Container::Glb | Container::Gltf | Container::Vrm => {
+            // VRM 就是 GLB：容器与解析路径都相同，VRM 扩展的识别在 `gltf::import` 里做。
             // glTF 的外部 buffer / 贴图是相对源文件目录的；插件自己没有磁盘权限，
             // 一律经宿主的 fs.read 读，读不到就让它留在 issues 里（不阻断导入）。
             let mut fetch = |path: &str| -> Option<Vec<u8>> {
@@ -940,7 +944,11 @@ fn force_extension(host: &Host, raw: &str, suffix: &str) -> (String, bool) {
 
 fn is_asset_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".fbx") || lower.ends_with(".glb") || lower.ends_with(".gltf")
+    lower.ends_with(".fbx")
+        || lower.ends_with(".glb")
+        || lower.ends_with(".gltf")
+        // VRM 就是 GLB 容器：清单扫描漏掉 `.vrm`，批量导入前「先摸家底」就摸不全。
+        || lower.ends_with(".vrm")
 }
 
 fn is_noise_dir(name: &str) -> bool {
@@ -1026,6 +1034,9 @@ mod tests {
     fn asset_names_are_case_insensitive() {
         assert!(is_asset_name("A.FBX"));
         assert!(is_asset_name("b.Glb"));
+        // VRM 是 GLB 容器，清单扫描必须一并收进来。
+        assert!(is_asset_name("avatar.vrm"));
+        assert!(is_asset_name("Avatar.VRM"));
         assert!(!is_asset_name("c.png"));
     }
 

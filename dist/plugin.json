@@ -88,7 +88,7 @@
       "title": "导出引擎加载器"
     }
   ],
-  "description": "把 FBX / glTF 资产解析成引擎内核可直接消费的 AIR 数据，支持二进制/JSON 导出、离线 HTML+数据分片预览与批量清单。",
+  "description": "把 FBX / glTF / VRM 资产解析成引擎内核可直接消费的 AIR 数据，支持二进制/JSON 导出、离线 HTML+数据分片预览与批量清单。",
   "id": "asset3d",
   "main": "asset3d.exe",
   "name": "3D 资产导入（AIR）",
@@ -97,7 +97,7 @@
   "timeoutMs": 120000,
   "tools": [
     {
-      "description": "解析工作区内的 .fbx / .glb / .gltf 三维资产，输出 AIR 摘要（网格、材质、贴图、骨骼、动画、包围盒）与导入期问题清单。只读，不写盘。",
+      "description": "解析工作区内的 .fbx / .glb / .gltf / .vrm 三维资产，输出 AIR 摘要（网格、材质、贴图、骨骼、动画、包围盒）与导入期问题清单。VRM（0.x / 1.0）按其 GLB 容器解析，并在摘要中标注 VRM 版本、humanoid 骨映射与 MToon 材质等情况。只读，不写盘。",
       "name": "inspect_asset",
       "parameters": {
         "additionalProperties": false,
@@ -123,7 +123,7 @@
       "risk": "read"
     },
     {
-      "description": "把 .fbx / .glb / .gltf 导入成引擎内核可直接消费的 AIR：导出 .air.bin（AIRB 二进制，几何平铺可直灌顶点缓冲）或 .air.json（便于 diff 与手改）。写盘后立即回读校验。",
+      "description": "把 .fbx / .glb / .gltf / .vrm 导入成引擎内核可直接消费的 AIR：导出 .air.bin（AIRB 二进制，几何平铺可直灌顶点缓冲）或 .air.json（便于 diff 与手改）。写盘后立即回读校验。VRM 的 toon 光照 / 描边 / 表情 / 摆裙等专有内容不支持，会以问题清单形式降级说明，不影响导入。",
       "name": "export_asset",
       "parameters": {
         "additionalProperties": false,
@@ -191,7 +191,7 @@
       "risk": "write"
     },
     {
-      "description": "递归扫描工作区目录，列出所有 .fbx / .glb / .gltf 资产及体积，便于批量导入前先摸清家底。",
+      "description": "递归扫描工作区目录，列出所有 .fbx / .glb / .gltf / .vrm 资产及体积，便于批量导入前先摸清家底。",
       "name": "list_assets",
       "parameters": {
         "additionalProperties": false,

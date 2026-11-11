@@ -46,7 +46,9 @@ pub fn import_doc(source: &Path) -> Result<AirDoc, String> {
         Container::FbxBinary | Container::FbxAscii => {
             crate::fbx::import(&mut doc, &bytes, &hint, true, true)?;
         }
-        Container::Glb | Container::Gltf => {
+        // VRM 与 GLB 是同一个容器、同一条解析路径：VRM 专有扩展的识别在
+        // `gltf::import` 内部完成（认出来 + 记降级说明，不阻断）。
+        Container::Glb | Container::Gltf | Container::Vrm => {
             // glTF 的外部 buffer / 贴图相对源文件目录；视口有真实磁盘权限，
             // 直接按目录拼接即可（`join` 遇到绝对路径会自动替换 base）。
             let base: PathBuf = source.parent().map(Path::to_path_buf).unwrap_or_default();

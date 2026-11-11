@@ -59,6 +59,15 @@ pub fn import(
         }
     }
 
+    // ---- VRM 专有内容 ----
+    // `.vrm` 就是 GLB，走的是同一条解析链；这里只负责「认出来 + 说清降级」。
+    // 识别结果进 `doc.vrm`（报告用）与 issues（人类可读说明），**绝不因此失败**——
+    // VRM 的 toon 光照 / 描边 / 表情 / 摆裙在 AIR 里没有对应物，那是能力边界，
+    // 不是数据损坏，把能力边界当导入错误会让所有 VRM 资产都进不来。
+    if let Some(info) = crate::vrm::VrmInfo::detect(&json) {
+        info.apply(doc);
+    }
+
     let g = Gltf {
         json: &json,
         notes: std::cell::RefCell::new(Vec::new()),
@@ -1405,5 +1414,105 @@ mod tests {
             let _ = g.read_scalars(&buffers, 0, 3, false);
         }
         assert_eq!(g.notes.borrow().len(), 1, "同一句降级只留一条");
+    }
+
+    // -----------------------------------------------------------------------
+    // VRM：`.vrm` 就是 GLB，走同一条解析链，只多一步「认出来 + 说清降级」
+    // -----------------------------------------------------------------------
+
+    /// 拼一个最小 GLB（只有 JSON chunk，没有 BIN）：VRM 元信息全在 JSON 里，
+    /// 不需要几何数据就能验证识别与降级链路。
+    fn glb_with_json(json: &Value) -> Vec<u8> {
+        let mut payload = serde_json::to_vec(json).expect("测试 JSON 应可序列化");
+        while payload.len() % 4 != 0 {
+            payload.push(b' ');
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"glTF");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&((12 + 8 + payload.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x4E4F534Au32.to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    fn vrm1_glb() -> Vec<u8> {
+        glb_with_json(&json!({
+            "asset": { "version": "2.0", "generator": "VRoid" },
+            "extensionsUsed": ["VRMC_vrm", "VRMC_materials_mtoon", "VRMC_springBone"],
+            "extensions": {
+                "VRMC_vrm": {
+                    "specVersion": "1.0",
+                    "meta": { "name": "Alicia", "authors": ["Someone"] },
+                    "humanoid": { "humanBones": {
+                        "hips": { "node": 0 },
+                        "spine": { "node": 1 }
+                    }},
+                    "expressions": { "preset": { "happy": {} } },
+                    "lookAt": { "type": "bone" }
+                },
+                "VRMC_springBone": { "springs": [{}] }
+            },
+            "nodes": [{ "name": "J_Bip_C_Hips" }, { "name": "J_Bip_C_Spine" }],
+            "materials": [{ "name": "Face", "extensions": { "VRMC_materials_mtoon": {} } }]
+        }))
+    }
+
+    /// `.vrm` 必须能被容器嗅探认成 glTF 家族，否则 `import_doc` 会在分流前就拒收。
+    #[test]
+    fn vrm_extension_is_sniffed_as_glb_container() {
+        let container = crate::util::sniff_container("alicia.vrm", &vrm1_glb())
+            .expect("VRM 不应被判为未知容器");
+        assert_eq!(container, crate::util::Container::Vrm);
+        assert!(container.is_gltf_family(), "VRM 必须落进 glTF 家族：{container:?}");
+        // 引擎加载器只认 fbx / glb / gltf，AIR 的 container 列必须写 glb。
+        assert_eq!(container.as_str(), "glb");
+        assert!(container.label().contains("VRM"), "报告里要写明是 VRM：{}", container.label());
+    }
+
+    /// 扩展名不是 `.vrm`、但 JSON chunk 里声明了 VRM 扩展的 GLB，同样要认成 VRM：
+    /// 不少导出器会把 `.vrm` 存成 `.glb`，只按扩展名判会漏掉。
+    #[test]
+    fn glb_declaring_vrm_extension_is_sniffed_as_vrm() {
+        let container = crate::util::sniff_container("avatar.glb", &vrm1_glb())
+            .expect(".glb 应当能识别");
+        assert_eq!(container, crate::util::Container::Vrm);
+    }
+
+    /// 端到端：VRM 走 `import` 不报错，`doc.vrm` 有值，issues 里能读到人类可读摘要，
+    /// 且绝不产生 errors —— 未知扩展 / 非标准骨名都不是导入失败的理由。
+    #[test]
+    fn vrm_glb_imports_with_summary_and_without_errors() {
+        let bytes = vrm1_glb();
+        let mut doc = AirDoc::new("glb", "alicia.vrm");
+        let mut fetch = |_: &str| None;
+        import(&mut doc, &bytes, "alicia.vrm", true, false, &mut fetch).expect("VRM 应当导入成功");
+
+        let vrm = doc.vrm.as_ref().expect("导入后必须挂上 VRM 识别结果");
+        assert_eq!(vrm.spec, crate::vrm::VrmSpec::V1);
+        assert_eq!(vrm.name, "Alicia");
+        assert_eq!(vrm.bones.len(), 2, "humanoid 骨映射要逐根解出");
+
+        assert!(doc.errors.is_empty(), "VRM 专有内容不得产生 error：{:?}", doc.errors);
+        let joined = doc.issues.join("\n");
+        assert!(joined.contains("VRM 内容：VRM 1.0"), "issues 里要有摘要行：{joined}");
+        assert!(joined.contains("MToon"), "MToon 降级必须说明：{joined}");
+        assert!(joined.contains("spring bone"), "spring bone 降级必须说明：{joined}");
+    }
+
+    /// 普通 GLB（无 VRM 扩展）不能被误判成 VRM：`vrm` 保持 `None`，issues 干净。
+    #[test]
+    fn plain_glb_is_not_mistaken_for_vrm() {
+        let bytes = glb_with_json(&json!({ "asset": { "version": "2.0" } }));
+        let mut doc = AirDoc::new("glb", "chair.glb");
+        let mut fetch = |_: &str| None;
+        import(&mut doc, &bytes, "chair.glb", true, false, &mut fetch).expect("普通 GLB 应当导入成功");
+        assert!(doc.vrm.is_none(), "非 VRM 文件不该挂 VRM 信息");
+        assert!(
+            !doc.issues.iter().any(|issue| issue.contains("VRM")),
+            "非 VRM 文件不该出现 VRM 相关 issue：{:?}",
+            doc.issues
+        );
     }
 }

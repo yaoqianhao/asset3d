@@ -13,7 +13,7 @@
 //! - 骨骼：ufbx 的权重按位号聚集（`deformer.vertices[v]` 给出区间），必须借上面的
 //!   映射搬到拆分后的顶点上，再取权重最大的 4 个并归一化。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -107,6 +107,26 @@ pub fn import(
         })
         .collect();
 
+    // ---- 骨架坐标系对齐 ----
+    // 部分 FBX（如 UE 导出的 mote3.fbx）把骨骼的「节点姿态」与「绑定姿态」写成了
+    // 相差 90° 的两套坐标系：TransformLink(bind_to_world) 是 Y-up 的绑定姿态，
+    // 节点 TRS 却是 Z-up（躺倒）。若直接拿节点世界矩阵当绑定姿态，静态帧自洽，
+    // 但骨架实体与网格正交、任何真实动画都会绕错轴崩坏。
+    // 处理方式与 Blender / UE 一致：取 bind_to_world × inv(node_world) 的旋转，
+    // 在骨骼根之上整体转正骨架，蒙皮矩阵按转正后的骨架世界计算。
+    let align = detect_skeleton_align(&scene);
+    let fix_nodes = match &align {
+        Some(a) => apply_skeleton_align(doc, &scene, &index_of, a),
+        None => Vec::new(),
+    };
+    if let Some(a) = &align {
+        doc.note(format!(
+            "骨架坐标系对齐：骨骼绑定姿态与节点姿态相差 {:.2}°（绕 ({:.2}, {:.2}, {:.2}) 轴），\
+             已在 {} 根骨骼之上插入对齐节点并把蒙皮矩阵换算到对齐后的骨架空间",
+            a.angle_deg, a.axis[0], a.axis[1], a.axis[2], fix_nodes.len()
+        ));
+    }
+
     // ---- 材质与贴图（全量抽出：即使没有被网格引用，也保留，便于诊断）----
     let mut material_id_to_index: HashMap<u32, u32> = HashMap::with_capacity(scene.materials.len());
     let mut textures: Vec<AirTexture> = Vec::new();
@@ -130,6 +150,13 @@ pub fn import(
             continue;
         };
         let mesh: &ufbx::Mesh = mesh_ref;
+        // 两件事必须分开：骨骼世界矩阵恒要前乘对齐旋转（骨架整体转过），
+        // 网格节点世界矩阵只有挂在被修正子树里时才跟着转。
+        let bone_align: Option<[f32; 16]> = align.as_ref().map(|a| a.rotation);
+        let node_align: Option<[f32; 16]> = match &align {
+            Some(a) if under_fix_nodes(doc, &fix_nodes, node_index as u32) => Some(a.rotation),
+            _ => None,
+        };
         let (air_mesh, skin_ref, skin_stats) = extract_mesh(
             mesh,
             node,
@@ -137,6 +164,8 @@ pub fn import(
             &doc.materials,
             &material_id_to_index,
             &index_of,
+            bone_align.as_ref(),
+            node_align.as_ref(),
         );
         // 蒙皮降级不能静默：超过 4 权重被截断、以及没有任何有效权重的顶点都要写进 issues
         let mesh_name = air_mesh.name.clone();
@@ -353,6 +382,8 @@ fn extract_mesh(
     materials: &[AirMaterial],
     material_id_to_index: &HashMap<u32, u32>,
     index_of: &HashMap<u32, u32>,
+    bone_align: Option<&[f32; 16]>,
+    node_align: Option<&[f32; 16]>,
 ) -> (AirMesh, Option<(u32, AirSkin)>, SkinStats) {
     // 顶点要落在「节点局部空间」：引擎会用 AirNode 的 TRS 沿父链累乘得到世界矩阵。
     // geometry_to_world 里同时含节点变换与单位/轴向换算，除掉节点自身世界矩阵后
@@ -513,7 +544,7 @@ fn extract_mesh(
     }
 
     let (skin_ref, joints, weights, skin_stats) =
-        extract_skinning(mesh, node, &vertex_source, index_of);
+        extract_skinning(mesh, node, &vertex_source, index_of, bone_align, node_align);
 
     (
         AirMesh {
@@ -610,6 +641,216 @@ fn resolve_material(
         .or(Some(raw_material))
 }
 
+
+/// 骨架坐标系对齐量：把骨骼从「节点姿态空间」旋回「绑定姿态空间」的纯旋转。
+struct SkeletonAlign {
+    /// 列主序 4x4，只有旋转部分（不给平移：骨骼根与网格共享原点，平移修正会引入
+    /// 无法从文件里可靠推断的偏差）。
+    rotation: [f32; 16],
+    axis: [f32; 3],
+    angle_deg: f32,
+}
+
+/// 探测骨骼的「节点姿态」与「绑定姿态(TransformLink)」之间是否存在整体坐标系差。
+///
+/// 逐根骨算 `G = bind_to_world × inv(node_world)`，正常文件里 G ≈ 单位阵；
+/// 坐标系写反的文件（如 UE 导出的 mote3.fbx）里 G 是一个固定的整体旋转。
+/// 取加权中位四元数作为代表值，按骨骼权重加权以免零权重的面骨干扰结果。
+fn detect_skeleton_align(scene: &ufbx::Scene) -> Option<SkeletonAlign> {
+    let mut samples: Vec<([f32; 4], f64)> = Vec::new();
+    for mesh in scene.meshes.iter() {
+        for deformer in mesh.skin_deformers.iter() {
+            for cluster in deformer.clusters.iter() {
+                let Some(bone) = cluster.bone_node.as_ref() else {
+                    continue;
+                };
+                let bind = util::mat4_from_ufbx(&cluster.bind_to_world);
+                let world = util::mat4_from_ufbx(&bone.node_to_world);
+                let g = util::mat4_mul(&bind, &util::mat4_invert(&world));
+                let quat = quat_of_rotation(&g);
+                let weight: f64 = cluster.weights.iter().sum();
+                samples.push((quat, weight));
+            }
+        }
+    }
+    if samples.len() < 3 {
+        return None;
+    }
+    // 候选数上限：中位四元数是 O(n²)，上千根骨时全量算会拖慢导入，
+    // 按权重排序取前 256 根（权重高的骨最能代表骨架整体）。
+    if samples.len() > 256 {
+        samples.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        samples.truncate(256);
+    }
+    let mut best = 0usize;
+    let mut best_cost = f64::MAX;
+    for (i, (candidate, _)) in samples.iter().enumerate() {
+        let mut cost = 0.0f64;
+        for (quat, weight) in samples.iter() {
+            cost += quat_angle_deg(*candidate, *quat) as f64 * weight.max(1e-6);
+        }
+        if cost < best_cost {
+            best_cost = cost;
+            best = i;
+        }
+    }
+    let quat = samples[best].0;
+    let angle_deg = quat_angle_deg(quat, [0.0, 0.0, 0.0, 1.0]);
+    // 阈值 1°：正常文件里这个差值来自浮点与导出器噪声，不应触发任何改动
+    if angle_deg < 1.0 {
+        return None;
+    }
+    let norm = (quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2]).sqrt();
+    let axis = if norm > 1e-6 {
+        [quat[0] / norm, quat[1] / norm, quat[2] / norm]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    Some(SkeletonAlign {
+        rotation: mat4_from_quat(quat),
+        axis,
+        angle_deg,
+    })
+}
+
+/// 取矩阵的旋转部分并转成四元数（先把三轴正交归一，绕开缩放/斜切噪声）。
+fn quat_of_rotation(m: &[f32; 16]) -> [f32; 4] {
+    let basis = [
+        [m[0], m[1], m[2]],
+        [m[4], m[5], m[6]],
+        [m[8], m[9], m[10]],
+    ];
+    util::quat_from_mat3(basis)
+}
+
+/// 四元数（x, y, z, w）→ 列主序 4x4 旋转矩阵。
+fn mat4_from_quat(q: [f32; 4]) -> [f32; 16] {
+    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+    let (xx, yy, zz) = (x * x, y * y, z * z);
+    let (xy, xz, yz) = (x * y, x * z, y * z);
+    let (wx, wy, wz) = (w * x, w * y, w * z);
+    [
+        1.0 - 2.0 * (yy + zz),
+        2.0 * (xy + wz),
+        2.0 * (xz - wy),
+        0.0,
+        2.0 * (xy - wz),
+        1.0 - 2.0 * (xx + zz),
+        2.0 * (yz + wx),
+        0.0,
+        2.0 * (xz + wy),
+        2.0 * (yz - wx),
+        1.0 - 2.0 * (xx + yy),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+}
+
+/// 两个四元数之间的夹角（度）。
+fn quat_angle_deg(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3])
+        .abs()
+        .clamp(0.0, 1.0);
+    2.0 * dot.acos().to_degrees()
+}
+
+/// 在每根骨骼之上插入一个纯旋转节点，把整套骨架旋到绑定姿态空间。
+///
+/// 插到「骨骼根」而不是直接改根的 TRS：动画轨道驱动的正是根节点的
+/// translation/rotation/scale，挂在根之上才能保证播放动画时对齐不被覆盖。
+/// 新节点追加到节点表末尾，既有下标（骨骼表、动画轨道引用）全部保持不变。
+fn apply_skeleton_align(
+    doc: &mut AirDoc,
+    scene: &ufbx::Scene,
+    index_of: &HashMap<u32, u32>,
+    align: &SkeletonAlign,
+) -> Vec<u32> {
+    let mut bones: HashSet<u32> = HashSet::new();
+    for mesh in scene.meshes.iter() {
+        for deformer in mesh.skin_deformers.iter() {
+            for cluster in deformer.clusters.iter() {
+                let Some(bone) = cluster.bone_node.as_ref() else {
+                    continue;
+                };
+                if let Some(&index) = index_of.get(&bone.element.element_id) {
+                    bones.insert(index);
+                }
+            }
+        }
+    }
+    if bones.is_empty() {
+        return Vec::new();
+    }
+    let mut roots: Vec<u32> = bones
+        .iter()
+        .copied()
+        .filter(|index| match doc.nodes.get(*index as usize).and_then(|n| n.parent) {
+            Some(parent) => !bones.contains(&parent),
+            None => true,
+        })
+        .collect();
+    roots.sort_unstable();
+
+    let (position, rotation, scale) = util::decompose(&align.rotation);
+    let mut created: Vec<u32> = Vec::with_capacity(roots.len());
+    for root in roots {
+        let Some(root_node) = doc.nodes.get(root as usize) else {
+            continue;
+        };
+        let parent = root_node.parent;
+        let base_name = if root_node.name.is_empty() {
+            format!("node{root}")
+        } else {
+            root_node.name.clone()
+        };
+        let root_path = root_node.path.clone();
+        let name = format!("{base_name}__axis_fix");
+        let path = if root_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{root_path}/__axis_fix")
+        };
+        let index = doc.nodes.len() as u32;
+        doc.nodes.push(AirNode {
+            index,
+            name,
+            path,
+            parent,
+            position,
+            rotation,
+            scale,
+            mesh: None,
+            skin: None,
+        });
+        doc.nodes[root as usize].parent = Some(index);
+        created.push(index);
+    }
+    created
+}
+
+/// `node` 是否落在被对齐旋转过的子树里。
+fn under_fix_nodes(doc: &AirDoc, fix_nodes: &[u32], node: u32) -> bool {
+    if fix_nodes.is_empty() {
+        return false;
+    }
+    let mut cursor = Some(node);
+    let mut guard = 0usize;
+    while let Some(current) = cursor {
+        if fix_nodes.contains(&current) {
+            return true;
+        }
+        guard += 1;
+        if guard > doc.nodes.len() {
+            return false;
+        }
+        cursor = doc.nodes.get(current as usize).and_then(|n| n.parent);
+    }
+    false
+}
+
 /// 蒙皮降级统计，由调用方写入 `doc.issues`，避免静默压权。
 #[derive(Debug, Clone, Copy, Default)]
 struct SkinStats {
@@ -632,6 +873,8 @@ fn extract_skinning(
     node: &ufbx::Node,
     vertex_source: &[u32],
     index_of: &HashMap<u32, u32>,
+    bone_align: Option<&[f32; 16]>,
+    node_align: Option<&[f32; 16]>,
 ) -> SkinResult {
     let Some(deformer) = mesh.skin_deformers.first() else {
         return (None, Vec::new(), Vec::new(), SkinStats::default());
@@ -639,7 +882,11 @@ fn extract_skinning(
 
     // 顶点在节点局部空间，IBM 要把局部顶点映射到骨骼绑定空间，因此需要节点自身的
     // 世界矩阵（AIR 里节点局部 → 世界正是由 AirNode 的 TRS 承担的）。
-    let node_world = util::mat4_from_ufbx(&node.node_to_world);
+    let mut node_world = util::mat4_from_ufbx(&node.node_to_world);
+    if let Some(align) = node_align {
+        // 网格节点落在被对齐的骨架子树里，世界矩阵同样被转过
+        node_world = util::mat4_mul(align, &node_world);
+    }
 
     // cluster 下标 → 关节槽位；骨骼节点不在场景树里的 cluster 直接丢弃
     let mut slot_of_cluster: Vec<Option<u16>> = vec![None; deformer.clusters.len()];
@@ -657,12 +904,15 @@ fn extract_skinning(
         }
         slot_of_cluster[cluster_index] = Some(joints.len() as u16);
         joints.push(node_index);
-        // 顶点留在节点局部空间，而 `bind_to_world` 是绑定姿态下骨骼的世界矩阵：
-        // 要让 `joint_world * IBM` 把局部顶点送到世界，IBM = invert(bind_to_world) * node_world。
-        inverse_bind.push(util::mat4_mul(
-            &util::mat4_invert(&util::mat4_from_ufbx(&cluster.bind_to_world)),
-            &node_world,
-        ));
+        // 顶点留在节点局部空间，IBM 要把局部顶点映射回骨骼空间。
+        // 骨骼世界矩阵与渲染端保持同一口径：骨架根之上已插入对齐节点时，
+        // 引擎算出的骨骼世界 = align × bone.node_to_world，这里必须同样前乘 align，
+        // 才能保证 `joint_world × IBM` 在绑定姿态下精确还原原始几何位置。
+        let mut bone_world = util::mat4_from_ufbx(&bone.node_to_world);
+        if let Some(align) = bone_align {
+            bone_world = util::mat4_mul(align, &bone_world);
+        }
+        inverse_bind.push(util::mat4_mul(&util::mat4_invert(&bone_world), &node_world));
     }
     if joints.is_empty() {
         return (None, Vec::new(), Vec::new(), SkinStats::default());

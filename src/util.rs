@@ -72,6 +72,9 @@ pub enum Container {
     FbxAscii,
     Glb,
     Gltf,
+    /// `.vrm`：VRM 0.x / 1.0 都装在 GLB 容器里，解析路径与 [`Container::Glb`] 完全一致，
+    /// 单独留一个分支只为两件事——报告里写清「这是 VRM」、以及把 VRM 扩展识别接上。
+    Vrm,
 }
 
 impl Container {
@@ -79,9 +82,17 @@ impl Container {
         match self {
             Container::FbxBinary => "fbx",
             Container::FbxAscii => "fbx",
-            Container::Glb => "glb",
+            // VRM 的 `container` 如实写 `glb`：AIR 的消费方（引擎加载器）只认 3 种容器，
+            // 凭空多一个 `vrm` 会让「能读的文件」变成「未知容器」。VRM 身份由
+            // `AirDoc::vrm` 与 issues 说明承载，不靠这一列。
+            Container::Glb | Container::Vrm => "glb",
             Container::Gltf => "gltf",
         }
+    }
+
+    /// 解析时按哪种语义走：VRM 与 GLB 共用一条链路。
+    pub fn is_gltf_family(self) -> bool {
+        matches!(self, Container::Glb | Container::Gltf | Container::Vrm)
     }
 
     pub fn label(self) -> &'static str {
@@ -90,16 +101,25 @@ impl Container {
             Container::FbxAscii => "FBX（ASCII）",
             Container::Glb => "glTF 二进制（GLB）",
             Container::Gltf => "glTF JSON（.gltf）",
+            Container::Vrm => "VRM（glTF 二进制，含 VRM 扩展）",
         }
     }
 }
 
 /// 按内容而不是扩展名判定容器：导入失败最常见的原因就是「扩展名是 .glb，内容
 /// 其实是别的」，先给一条能自证的错误比让解析器抛底层异常更好诊断。
+///
+/// VRM 的判定分两步：先按 GLB 认出容器，再看它是不是 VRM——
+/// 扩展名是 `.vrm`，或 JSON chunk 里出现 `VRM` / `VRMC_vrm` 扩展声明。
+/// **只看 JSON chunk**，不扫二进制体：几 MB 的顶点数据里撞上这几个字节纯属偶然，
+/// 而按 spec 第一个 chunk 一定是 JSON。
 pub fn sniff_container(path: &str, bytes: &[u8]) -> Result<Container, String> {
     if bytes.len() >= 12 {
         // GLB: magic "glTF" + version(4) + length(4)
         if &bytes[0..4] == b"glTF" {
+            if glb_declares_vrm(bytes) || extension(path) == "vrm" {
+                return Ok(Container::Vrm);
+            }
             return Ok(Container::Glb);
         }
         // FBX 二进制: "Kaydara FBX Binary  \x00"
@@ -124,9 +144,38 @@ pub fn sniff_container(path: &str, bytes: &[u8]) -> Result<Container, String> {
     }
     let ext = extension(path);
     Err(format!(
-        "无法识别的 3D 容器：扩展名 `{ext}`，开头字节 {:02X?}。支持 .fbx / .glb / .gltf",
+        "无法识别的 3D 容器：扩展名 `{ext}`，开头字节 {:02X?}。支持 .fbx / .glb / .gltf / .vrm",
         &bytes[..bytes.len().min(8)]
     ))
+}
+
+/// GLB 的 JSON chunk 里是否声明了 VRM 扩展（`VRM` / `VRMC_vrm`）。
+///
+/// 只读第一个 chunk：GLB 规范要求 chunk 0 是 JSON，二进制体在 chunk 1，
+/// 在几 MB 顶点数据里搜这几个字母会撞出假阳性。长度字段不可信时（文件被截断）
+/// 退化成「扫头部 64 KiB」，够覆盖 JSON 而不会把整个二进制体拉进来。
+fn glb_declares_vrm(bytes: &[u8]) -> bool {
+    if bytes.len() < 20 {
+        return false;
+    }
+    let chunk_len = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+    let (start, end) = if chunk_len > 0 && 20 + chunk_len <= bytes.len() {
+        (20, 20 + chunk_len)
+    } else {
+        (20, bytes.len().min(20 + 64 * 1024))
+    };
+    let json = &bytes[start..end];
+    contains_bytes(json, b"\"VRMC_vrm\"") || contains_bytes(json, b"\"VRM\"")
+}
+
+/// 子串查找（不引第三方依赖）：首字节先比，命中再逐字节核。
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +541,10 @@ pub fn mat4_invert(m: &[f32; 16]) -> [f32; 16] {
     }
     let inv_det = 1.0 / det;
 
-    [
+    // 伴随矩阵算法得到的是「行主序」排列，而本文件统一列主序（m[col * 4 + row]），
+    // 因此这里再转置一次，否则返回的其实是逆矩阵的转置——旋转块看似正确、
+    // 平移会整体错位（蒙皮后顶点飞出去）。
+    let row_major = [
         (a11 * b11 - a12 * b10 + a13 * b09) * inv_det,
         (a02 * b10 - a01 * b11 - a03 * b09) * inv_det,
         (a31 * b05 - a32 * b04 + a33 * b03) * inv_det,
@@ -509,5 +561,13 @@ pub fn mat4_invert(m: &[f32; 16]) -> [f32; 16] {
         (a00 * b09 - a01 * b07 + a02 * b06) * inv_det,
         (a31 * b01 - a30 * b03 - a32 * b00) * inv_det,
         (a20 * b03 - a21 * b01 + a22 * b00) * inv_det,
-    ]
+    ];
+
+    let mut out = [0.0f32; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            out[col * 4 + row] = row_major[row * 4 + col];
+        }
+    }
+    out
 }

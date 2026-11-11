@@ -99,7 +99,7 @@ pub fn render_empty(assets: &[(String, u64)], scanned: bool) -> Value {
             "title": "工作区里的资产",
             "children": [{
                 "type": "text",
-                "value": "工作区里没有找到 .fbx / .glb / .gltf 资产。",
+                "value": "工作区里没有找到 .fbx / .glb / .gltf / .vrm 资产。",
             }],
         }));
     }
@@ -119,6 +119,12 @@ fn overview(rel: &str, doc: &AirDoc) -> Value {
         stat("容器", &doc.source.container),
         stat("体积", &util::format_bytes(doc.source.bytes)),
     ];
+    // VRM 的 `container` 按 AIR 口径写的是 `glb`（引擎加载器只认三种容器），
+    // 面板里必须另起一行写清「这是 VRM」，否则用户会以为扩展名被吞了。
+    if let Some(vrm) = &doc.vrm {
+        info.push(stat("规范", vrm.spec.label()));
+        info.push(stat("VRM", &vrm.summary_line()));
+    }
     if let Some(unit) = doc.source.native_unit_meters {
         info.push(stat("源单位（米）", &format!("{unit:.4}")));
     }
@@ -535,6 +541,34 @@ mod tests {
         assert_eq!(cut.chars().count(), MAX_CELL_CHARS + 1);
         assert!(cut.ends_with('…'));
         assert_eq!(cell("a\nb"), "a b");
+    }
+
+    /// VRM 资产的概览必须单独写明「规范 / VRM」两行：`container` 一律写 `glb`，
+    /// 只靠那一行用户看不出这个文件是 VRM。
+    #[test]
+    fn vrm_overview_states_spec_and_summary() {
+        let mut vrm_doc = doc();
+        vrm_doc.source.container = "glb".to_string();
+        vrm_doc.vrm = Some(crate::vrm::VrmInfo::detect(&json!({
+            "asset": { "version": "2.0" },
+            "extensionsUsed": ["VRMC_vrm"],
+            "extensions": {
+                "VRMC_vrm": {
+                    "specVersion": "1.0",
+                    "meta": { "name": "Alicia" },
+                    "humanoid": { "humanBones": { "hips": { "node": 0 } } }
+                }
+            }
+        }))
+        .expect("测试 JSON 应识别为 VRM"));
+
+        let raw = serde_json::to_string(&overview("art/alicia.vrm", &vrm_doc)).expect("序列化");
+        assert!(raw.contains("VRM 1.0"), "概览要写明规范版本：{raw}");
+        assert!(raw.contains("Alicia"), "概览要带上头像名：{raw}");
+
+        // 普通资产不能凭空多出 VRM 行。
+        let plain = serde_json::to_string(&overview("art/chair.glb", &doc())).expect("序列化");
+        assert!(!plain.contains("VRM"), "非 VRM 资产不该出现 VRM 行：{plain}");
     }
 
     #[test]

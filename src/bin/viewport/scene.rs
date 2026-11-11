@@ -131,17 +131,20 @@ pub fn load(path: &Path) -> Result<Scene, String> {
     let container = match ext.as_str() {
         "glb" => "glb",
         "gltf" => "gltf",
+        // VRM 就是 GLB（0.x / 1.0 都是）：容器写 `glb`，VRM 专有扩展的识别在
+        // `gltf::import` 里完成（结果进 `doc.vrm` 与 `doc.issues`，不影响开窗）。
+        "vrm" => "glb",
         "fbx" => "fbx",
         other => {
             return Err(format!(
-                "不认识的扩展名 `.{other}`：视口只支持 .glb / .gltf / .fbx"
+                "不认识的扩展名 `.{other}`：视口只支持 .glb / .gltf / .vrm / .fbx"
             ))
         }
     };
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut doc = AirDoc::new(container, &hint);
     match ext.as_str() {
-        "glb" | "gltf" => {
+        "glb" | "gltf" | "vrm" => {
             let mut fetch = |uri: &str| read_sibling(&dir, uri);
             let fetch_ref: &mut dyn FnMut(&str) -> Option<Vec<u8>> = &mut fetch;
             // embed_textures = true：视口拿不到宿主的 `host/fs.read`，GLB 的图像又在

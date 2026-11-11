@@ -2,16 +2,18 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 04526fdd866a8c5c9aceee6b83ed2c05_a294c8add1bb11f1b84e52540064ee0f
-    ReservedCode1: AHt1q5SFG1KpCOqm58DvetdKlpPvhT40uGdQzV+oC8tluUDMCy4e7B9bd5J+5E4EPLL4qNhVYRq1iqE1TxAoQ1Ch6iTQqsOgxcQPEppscYvejERyzMqcZEdyFN1ZTMRGuyb70bMOczTcvqU9BD6jWrKnra8+4KRb44Gs5Cu9YaKfRbFXSbP8+E2gmCg=
+    ProduceID: 04526fdd866a8c5c9aceee6b83ed2c05_727334bdd9bc11f1bc42525400638852
+    ReservedCode1: OVqGHUCSpNXehDENS3VFIdqCmk2oY9pHJ1xIu22HtxwuVRDz6xBmt1XcDvXng3CPfkLkYiNJckyjXzdfA0Blq4LbvPq21Ze3haEaOLMYXDuatrIZLsMd8zdoRyJUVmEZejwFf2k50bioKKkSXe3fJDa6PM4uu86hLtcBezPSyhW1qJI1aB6J6lXLnXo=
     ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 04526fdd866a8c5c9aceee6b83ed2c05_a294c8add1bb11f1b84e52540064ee0f
-    ReservedCode2: AHt1q5SFG1KpCOqm58DvetdKlpPvhT40uGdQzV+oC8tluUDMCy4e7B9bd5J+5E4EPLL4qNhVYRq1iqE1TxAoQ1Ch6iTQqsOgxcQPEppscYvejERyzMqcZEdyFN1ZTMRGuyb70bMOczTcvqU9BD6jWrKnra8+4KRb44Gs5Cu9YaKfRbFXSbP8+E2gmCg=
+    PropagateID: 04526fdd866a8c5c9aceee6b83ed2c05_727334bdd9bc11f1bc42525400638852
+    ReservedCode2: OVqGHUCSpNXehDENS3VFIdqCmk2oY9pHJ1xIu22HtxwuVRDz6xBmt1XcDvXng3CPfkLkYiNJckyjXzdfA0Blq4LbvPq21Ze3haEaOLMYXDuatrIZLsMd8zdoRyJUVmEZejwFf2k50bioKKkSXe3fJDa6PM4uu86hLtcBezPSyhW1qJI1aB6J6lXLnXo=
 ---
+
+
 
 # asset3d
 
-ai-ide 的 3D 资产导入插件：把 `.fbx` / `.glb` / `.gltf` 解析成引擎内核可直接消费的 **AIR** 数据，并给出离线预览。
+ai-ide 的 3D 资产导入插件：把 `.fbx` / `.glb` / `.gltf` / `.vrm` 解析成引擎内核可直接消费的 **AIR** 数据，并给出离线预览。
 
 插件本体是一个独立可执行文件（Windows 下为 `asset3d.exe`），通过 NDJSON 帧协议与宿主通信；不参与宿主内核的 Cargo workspace。
 
@@ -60,7 +62,7 @@ ai-ide 的 3D 资产导入插件：把 `.fbx` / `.glb` / `.gltf` 解析成引擎
 | `inspect_asset` | read | 解析资产并输出 AIR 摘要：网格/材质/贴图/骨骼/动画/包围盒 + 导入期问题清单。只读，不写盘 |
 | `export_asset` | write | 导出 `.air.bin`（AIRB v1 二进制，几何平铺可直灌顶点缓冲）与/或 `.air.json`（便于 diff 与手改），写盘后立即回读校验 |
 | `preview_asset` | write | 生成离线预览：薄 HTML 骨架 + 若干 `.shard.NN.js` 数据分片，浏览器/Electron 直接打开，无需服务器 |
-| `list_assets` | read | 递归扫描工作区目录，列出所有 `.fbx` / `.glb` / `.gltf` 及体积，便于批量导入前摸家底 |
+| `list_assets` | read | 递归扫描工作区目录，列出所有 `.fbx` / `.glb` / `.gltf` / `.vrm` 及体积（`.vrm` 单独标 `VRM`），便于批量导入前摸家底 |
 | `view_render` | read | 插件面板视图入口（`aiide.view/1`）：把资产折成一棵声明式描述树（概览/材质/贴图/动画/骨骼/导入问题/动作按钮）交给宿主面板渲染；省略 `path` 时列出工作区可打开的资产。只读，不解析动画轨道 |
 | `export_engine_loader` | write | 把引擎侧读取 AIR/AIRB 的 Rust 加载器源码（纯 std + serde）写到指定路径，附格式说明 |
 
@@ -81,13 +83,33 @@ ai-ide 的 3D 资产导入插件：把 `.fbx` / `.glb` / `.gltf` 解析成引擎
 
 ## 能力边界
 
-- **只认 `.fbx` / `.glb` / `.gltf`**。`.obj` / `.dae` / `.usd` / `.blend` 一概不处理，也不做格式互转。
+- **只认 `.fbx` / `.glb` / `.gltf` / `.vrm`**。`.obj` / `.dae` / `.usd` / `.blend` 一概不处理，也不做格式互转。
 - **只读不查盘**：所有文件访问都走宿主 `host/fs.read` / `host/fs.write` / `host/fs.stat` / `host/fs.list` 原语，插件自己不开文件句柄。因此路径必须落在宿主工作区内——越界路径由宿主闸门拒绝；插件侧不做路径预判，也不绕闸门读盘。
 - **不做纹理转码**：贴图按原字节（base64 或原样）搬运，不解 PNG/JPEG、不生成 mipmap、不改色彩空间。**视口进程是例外**——它为了把花纹画出来会解码 PNG/JPEG（见「视口」一节），但插件侧的输出仍不动贴图字节。
 - **不烘焙**：节点 TRS 原样进 AIR，顶点保持 mesh 局部空间（蒙皮/骨骼动画都靠节点链与关节矩阵在引擎侧还原）。HTML 预览不做蒙皮变形；视口按绑定姿态做（见「视口」一节）。
 - **动画只到「轨道级求值」**：`air::AirTrack::sample_at` 能按时间算出某节点的 TRS，`AirAnimation::apply_at` 把它写回节点，`wrap_time` 负责循环相位；插值只有 `linear` 与 `step`（`CUBICSPLINE` 的切线在提取阶段就丢了，降级为 `linear`，见 `interpolation` 字段）。父子链叠加、`skin` 权重与蒙皮变形不在这一层——它们的输入是关节矩阵，属于消费端。
 - **不做网格优化**：不去重顶点、不重排索引、不生成 LOD；只有预览在超预算时才截断三角形（见下）。
 - **不写引擎资产格式**：输出只有 AIR（`.air.bin` / `.air.json`），不生成 glTF/FBX，也不写引擎自定义二进制。
+
+### VRM（`.vrm`）
+
+`.vrm` 不是新容器：VRM 0.x 与 VRM 1.0 都是 **GLB**，因此解析、导出、预览、视口全部复用同一个 `gltf` 解析器，**没有第二条代码路径**。多出来的是三件事：
+
+1. **认出来**：容器嗅探有独立的 `Container::Vrm` 分支（`src/util.rs`）。判据是扩展名 `.vrm` **或** GLB 的 JSON chunk 里出现 `"VRM"` / `"VRMC_vrm"` 声明——不少导出器把 VRM 存成 `.glb`，只按扩展名判会漏。识别结果落在 `AirDoc::vrm`（`src/vrm.rs`），只用于报告；`source.container` 仍写 `glb`，因为引擎加载器只认 `fbx` / `glb` / `gltf` 三种。
+2. **说清楚降级**：头像名 / 作者 / 授权 / humanoid 骨映射数 / MToon 材质 / 表情数 / spring bone 链数 / lookAt 会拼成一行摘要进 `issues`，每类专有语义各附一条降级说明。**只进 `issues`、绝不进 `errors`**：VRM 专有内容缺失是能力边界，当成阻断级问题会让所有 VRM 都无法导出。
+3. **不因未知内容失败**：`extensionsUsed` 里的 VRM 族与非 VRM 扩展、`J_Bip_C_*` 这类非 glTF 标准骨名，一律按普通 glTF 语义照读，不拒收。
+
+| VRM 内容 | 在 AIR 里的去向 |
+| --- | --- |
+| 几何 / 贴图 / 材质 / 节点 / 蒙皮 / 动画 | 与 GLB 完全一致 |
+| humanoid 骨映射（`humanBones`） | 不单独保存；骨骼按 glTF 节点与蒙皮原样导入，节点名与骨名一一对应，重定向按名字匹配 |
+| MToon 材质 | 按 glTF PBR 降级（基色 / 金属度 / 粗糙度 / 贴图）；明暗分界、描边、toon 渐变、光照模型不进 AIR |
+| 表情（`blendShapeGroups` / `expressions`） | morph target 只作为网格变形数据；表情名与权重控制不进 AIR，播放侧无法按名驱动 |
+| spring bone（摆裙 / 头发） | 不导入：AIR 未定义物理节点，需引擎侧自行实现 |
+| lookAt / firstPerson | 不导入 |
+| 缩略图（`meta.texture`） | 只把贴图下标写进摘要，不当资产导出 |
+
+视口（`asset3d-gui.exe --standalone`、拖放、`O` 文件对话框）与 `asset3d-retarget --target` 同样接受 `.vrm`；重定向输出仍是 `.glb`（`--out` 只认 `.glb`）。
 
 ## 视口：asset3d-gui.exe
 
@@ -217,7 +239,8 @@ ai-ide 的 3D 资产导入插件：把 `.fbx` / `.glb` / `.gltf` 解析成引擎
 7. **贴图只搬字节**：插件不转码、不缩放，超大贴图在预览里会被排除（导出不受影响）；视口会解码，但超过 4096×4096 的贴图不解码，画面上退回纯色并在 `notes` 里给原因。
 8. **视口不排序半透明、不打 mipmap**：alpha 一律当不透明，远处贴图会有摩尔纹。静态渲染的取舍，不是 bug。
 9. **视口截图是协议占位**：`screenshot` 回 `unsupported`，要图请用系统截图。
-10. **单进程单线程处理工具调用**：工具在独立线程执行（否则解析期间连宿主回包都收不到），但同一时刻只跑一个工具；并发调用会排队。
+10. **VRM 只按 glTF 语义导入**：MToon 的描边/toon 明暗、表情名与权重控制、spring bone 物理、lookAt、firstPerson 都不进 AIR（见「VRM」一节的对照表）；这些内容以 issue 形式记录，不会让导入失败。
+11. **单进程单线程处理工具调用**：工具在独立线程执行（否则解析期间连宿主回包都收不到），但同一时刻只跑一个工具；并发调用会排队。
 
 ## 开发与验证
 
@@ -234,4 +257,5 @@ python dev\verify_preview.py
 
 - 格式与协议版本：`pluginApi 1.1`、AIRB `v1`、视口会话 `asset3d.session/1`
 - 插件版本：见 `CHANGELOG.md`，当前 `0.4.0`
+*（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*

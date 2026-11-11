@@ -264,7 +264,7 @@ impl Layout {
             let footer = if input.panel.scanning {
                 Some("扫描中…".to_string())
             } else if total == 0 {
-                Some("没有找到 .glb / .gltf / .fbx".to_string())
+                Some("没有找到 .glb / .gltf / .vrm / .fbx".to_string())
             } else {
                 let last = (start + rows.len()).min(total);
                 let mut text = format!("{}-{} / {total}", start + 1, last);

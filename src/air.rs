@@ -45,6 +45,13 @@ pub struct AirDoc {
     /// 不符、权重和不为 1）。与 `issues` 分开，导出工具据此拒写盘。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// VRM 专有内容识别结果（`VRM` / `VRMC_vrm` 扩展）。
+    ///
+    /// `#[serde(skip)]`：**不进 AIR 落盘格式**。它是「导入期洞察」，作用域仅限本次
+    /// 进程内的检查与摘要展示；AIR 文件里表达它的是 `issues` 里那几行人类可读说明。
+    /// 这样加字段不需要动 `AIR_VERSION`，也不会让消费方的反序列化多一个必填项。
+    #[serde(skip)]
+    pub vrm: Option<crate::vrm::VrmInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -499,6 +506,7 @@ impl AirDoc {
             stats: AirStats::default(),
             issues: Vec::new(),
             errors: Vec::new(),
+            vrm: None,
         }
     }
 
@@ -758,9 +766,28 @@ impl AirDoc {
             out,
             "  源文件    {}（{}，{}）",
             self.source.path,
-            self.source.container.to_ascii_uppercase(),
+            // VRM 本质是 GLB，`container` 字段如实写 `glb`（消费方按 GLB 处理）；
+            // 但报告正文得让人一眼看出「这是个 VRM」，所以这里另加版本标签。
+            match &self.vrm {
+                Some(vrm) => format!(
+                    "{}，{}",
+                    self.source.container.to_ascii_uppercase(),
+                    vrm.spec.label()
+                ),
+                None => self.source.container.to_ascii_uppercase(),
+            },
             crate::util::format_bytes(self.source.bytes)
         );
+        if let Some(vrm) = &self.vrm {
+            let _ = writeln!(out, "  VRM       {}", vrm.summary_line());
+            if !vrm.vrm_extensions.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  VRM 扩展  {}",
+                    vrm.vrm_extensions.join("、")
+                );
+            }
+        }
         if let Some(unit) = self.source.native_unit_meters {
             let _ = writeln!(
                 out,

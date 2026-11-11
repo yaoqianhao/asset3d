@@ -15,7 +15,7 @@ AIGC:
 （`D:\share\character\rebelsoldier.glb` 这类）身上，输出一个**能直接播放**的新 GLB。
 
 ```
-asset3d-retarget.exe  --source <动作.glb|fbx>  --target <角色.glb>  --out <输出.glb>
+asset3d-retarget.exe  --source <动作.glb|fbx>  --target <角色.glb|vrm>  --out <输出.glb>
 ```
 
 一次调用做四件事：读源动作 → 建骨骼映射 → 逐帧求解姿态 → 写新 GLB 并**读回自检**。
@@ -54,7 +54,7 @@ cargo build --release --bin asset3d-retarget
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `--source <path>` | 是 | 源动作文件，支持 `.glb` / `.fbx`。读第 0 条动作，或用 `--anim` 指定 |
-| `--target <path>` | 是 | 目标角色 `.glb`，需带 mesh + skin（可以完全没有动画） |
+| `--target <path>` | 是 | 目标角色 `.glb` / `.vrm`，需带 mesh + skin（可以完全没有动画） |
 | `--out <path>` | 是 | 输出 `.glb` 路径，新文件 |
 | `--map <json>` | 否 | 追加/覆盖骨骼映射，两种写法都认：`{"spine_04":"Spine02"}` 或 `[{"source":"spine_04","target":"Spine02"}]`。同名条目**顶掉**内置表，新名字**追加** |
 | `--anim <name>` | 否 | 源文件含多条动作时按名字挑一条（默认第 0 条） |
@@ -187,6 +187,7 @@ $env:ASSET3D_POSE_SHOT_AT="f00:0,f25:0.25,f50:0.5,f75:0.75,f99:0.999"
 5. **一次只处理一条动作**：源文件多条动作需逐条 `--anim` 调用，产物是各自独立的 GLB（不合并成多 clip）。
 6. **骨架假设**：内置表针对 UE5 Mannequin 命名 + Tripo 人形绑定。换成 Mixamo 或其他绑定需靠 `--map` 补齐，报告里会逐条列缺失骨。
 7. **产物体积**：写动画不重打包贴图，所以产物 ≈ 目标资产 + 动画数据（本例 +50 KB ~ +320 KB）。
+8. **VRM 目标按节点名匹配，不读 humanoid 映射**：`--target` 可以指向 `.vrm`（VRM 是 GLB，解析走同一条路），但映射表仍按**节点名**匹配 UE 骨骼名。VRM 1.0 常见节点名是 `J_Bip_C_Hips` 这类 VRM 骨名，而非 Tripo 的 `Hip`，内置表命中率会很低，需用 `--map` 逐条指定；VRM 文件里 `VRMC_vrm.humanoid.humanBones` 到节点的对应关系目前只在 `asset3d` 的导入侧读到（用于摘要），重定向器尚未消费。
 
 ## 8. 排错
 

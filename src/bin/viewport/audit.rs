@@ -1,4 +1,4 @@
-//! 资产白模审计：把「这一目录下的 `.glb` 到底会不会被画成白模」变成一张可核对的表。
+//! 资产白模审计：把「这一目录下的 `.glb` / `.vrm` 到底会不会被画成白模」变成一张可核对的表。
 //!
 //! 背景：8K 贴图超 `MAX_TEXTURE_PIXELS` 被丢弃时，视口只剩 `baseColorFactor`，
 //! 而绝大多数资产的白模就是「贴图没绑上 + baseColor 恰是纯白」。肉眼判断不可靠，
@@ -88,6 +88,15 @@ pub fn dir_from_env() -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+/// 扩展名是否命中审计目标。
+///
+/// `.vrm` 命中 `glb`：VRM 就是 GLB 容器，审计「这一目录下的 glb 会不会被画成白模」
+/// 时漏掉同目录的 VRM 头像，等于把一份有漏项的结果当成「全部正常」。
+fn ext_matches(name: &str, want: &str) -> bool {
+    name.eq_ignore_ascii_case(want)
+        || (want.eq_ignore_ascii_case("glb") && name.eq_ignore_ascii_case("vrm"))
+}
+
 /// 递归收集 `root` 下指定扩展名的文件（大小写不敏感，按路径排序保证可复跑）。
 pub fn collect(root: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -104,7 +113,7 @@ pub fn collect(root: &Path, ext: &str) -> Vec<PathBuf> {
                     let hit = path
                         .extension()
                         .and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case(ext))
+                        .map(|e| ext_matches(e, ext))
                         .unwrap_or(false);
                     if hit {
                         out.push(path);
@@ -262,7 +271,7 @@ pub fn run(root: &Path, report: &Path) -> i32 {
     let files = collect(root, "glb");
     let root_str = root.to_string_lossy().replace('\\', "/");
     eprintln!(
-        "asset3d 审计：{} 下 {} 个 .glb",
+        "asset3d 审计：{} 下 {} 个 .glb/.vrm",
         root.display(),
         files.len()
     );
@@ -325,7 +334,7 @@ fn write_markdown(target: &Path, root: &Path, rows: &[Row]) -> Result<(), String
     let mut out = String::new();
     out.push_str("# asset3d 白模审计\n\n");
     out.push_str(&format!("- 审计根目录：`{}`\n", root.display()));
-    out.push_str(&format!("- 资产数：{}（递归 `*.glb`）\n", rows.len()));
+    out.push_str(&format!("- 资产数：{}（递归 `*.glb` / `*.vrm`）\n", rows.len()));
     let white = rows.iter().filter(|r| r.verdict == Verdict::White).count();
     out.push_str(&format!("- 判为白模：{white}\n"));
     out.push_str(&format!(
@@ -503,12 +512,14 @@ mod tests {
         std::fs::write(root.join("b.glb"), b"x").unwrap();
         std::fs::write(root.join("sub").join("a.GLB"), b"x").unwrap();
         std::fs::write(root.join("sub").join("c.fbx"), b"x").unwrap();
+        // VRM 就是 GLB 容器：审计 `.glb` 时必须一并收进来，不能漏。
+        std::fs::write(root.join("sub").join("d.vrm"), b"x").unwrap();
         let found = collect(&root, "glb");
         let names: Vec<String> = found
             .iter()
             .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
             .collect();
-        assert_eq!(names, vec!["b.glb", "sub/a.GLB"]);
+        assert_eq!(names, vec!["b.glb", "sub/a.GLB", "sub/d.vrm"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

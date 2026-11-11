@@ -1,7 +1,11 @@
 //! asset3d —— ai-ide 的 3D 资产导入插件。
 //!
-//! 职责：把工作区里的 `.fbx` / `.glb` / `.gltf` 解析成引擎内核可直接消费的
+//! 职责：把工作区里的 `.fbx` / `.glb` / `.gltf` / `.vrm` 解析成引擎内核可直接消费的
 //! **AIR**（Asset Intermediate Representation），并提供导出、预览与批量清单能力。
+//!
+//! `.vrm`（VRM 0.x / 1.0）本质是 GLB 容器：Geo / 材质 / 骨骼 / 动画走与 glTF 完全相同的
+//! 解析链，VRM 专有扩展（`VRM` / `VRMC_vrm`、MToon、humanoid 骨映射、表情、SpringBone）
+//! 只做识别与降级说明（见 [`vrm`]），**不因未知扩展或 VRM 骨名而导入失败**。
 //!
 //! 进程模型（与 `crates/plugin` 的宿主侧约定逐条对齐，改这里之前先看
 //! `docs/14` 插件协议）：
@@ -29,6 +33,7 @@ mod tools;
 mod ui;
 mod util;
 mod view;
+mod vrm;
 
 use std::io::BufRead;
 use std::sync::Arc;
@@ -513,7 +518,7 @@ fn manifest() -> Value {
         "id": PLUGIN_ID,
         "name": "3D 资产导入（AIR）",
         "version": PLUGIN_VERSION,
-        "description": "把 FBX / glTF 资产解析成引擎内核可直接消费的 AIR 数据，支持二进制/JSON 导出、离线 HTML+数据分片预览与批量清单。",
+        "description": "把 FBX / glTF / VRM 资产解析成引擎内核可直接消费的 AIR 数据，支持二进制/JSON 导出、离线 HTML+数据分片预览与批量清单。",
         "pluginApi": format!("{PLUGIN_API_MAJOR}.{PLUGIN_API_MINOR}"),
         // 入口是可执行文件名：宿主按清单在包内定位并 spawn。
         "main": if cfg!(windows) { "asset3d.exe" } else { "asset3d" },

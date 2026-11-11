@@ -2,12 +2,14 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 04526fdd866a8c5c9aceee6b83ed2c05_a365b46ed1bb11f1b84e52540064ee0f
-    ReservedCode1: KnywNPxekYS190ngNQiPht9kMa6TJ6It/MklPWmE+RnGHZ0tNigDweJ1wkPxMTlwQXnWmVWhEjiUVfoTsYIoQWqgidTyKk1N1M0CKfL9zsejMsHWzXMxpdg5bzIAHObnOdpihDgmspJSY+DguKRuDOa/kMsTUC9LX7VkR2ZUVsyLYFGlKFXLMD8+dYU=
+    ProduceID: 04526fdd866a8c5c9aceee6b83ed2c05_73c13af3d9bc11f1ba6252540064ee0f
+    ReservedCode1: TPvA2U2fAg+Xmmm5OwkyZYV1ko/I+XcMAy3t5rW3n7SX1tDo5uVbBJfic8/t6e7vX6plQRnYDtudE/E9Cecu44UunYlAyu1HWocDbMuluLlJBG68AoQZR514xs0PNLrPpQHL/2KhVy5kb1Gs+l9bizr04WsgK6XF4jgBoiu7AkXQtKEosEk+7Epbwr0=
     ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 04526fdd866a8c5c9aceee6b83ed2c05_a365b46ed1bb11f1b84e52540064ee0f
-    ReservedCode2: KnywNPxekYS190ngNQiPht9kMa6TJ6It/MklPWmE+RnGHZ0tNigDweJ1wkPxMTlwQXnWmVWhEjiUVfoTsYIoQWqgidTyKk1N1M0CKfL9zsejMsHWzXMxpdg5bzIAHObnOdpihDgmspJSY+DguKRuDOa/kMsTUC9LX7VkR2ZUVsyLYFGlKFXLMD8+dYU=
+    PropagateID: 04526fdd866a8c5c9aceee6b83ed2c05_73c13af3d9bc11f1ba6252540064ee0f
+    ReservedCode2: TPvA2U2fAg+Xmmm5OwkyZYV1ko/I+XcMAy3t5rW3n7SX1tDo5uVbBJfic8/t6e7vX6plQRnYDtudE/E9Cecu44UunYlAyu1HWocDbMuluLlJBG68AoQZR514xs0PNLrPpQHL/2KhVy5kb1Gs+l9bizr04WsgK6XF4jgBoiu7AkXQtKEosEk+7Epbwr0=
 ---
+
+
 
 # 变更记录
 
@@ -35,6 +37,17 @@ M-UI-4 第一刀：把动画从「只统计条数」推进到「能按时间点�
 
 - 采样是逐轨道独立求值，不含骨骼层级与蒙皮：`apply_at` 只把 TRS 写到节点自身，父子叠加与 `skin` 权重留给第二刀（视口骨骼矩阵 + 蒙皮着色器）。
 - 只支持 `linear` / `step`。`CUBICSPLINE` 的切线在 AIR 里没有存放位置，降级是既定口径，不是待办。
+
+### VRM（`.vrm`）导入
+
+- **支持导入 `.vrm`（VRM 0.x / VRM 1.0）**：VRM 本质是 GLB 容器，因此不走第二条解析路径——几何、贴图、材质、节点、蒙皮、动画全部复用现有 `gltf` 解析器，`AirDoc::source.container` 仍写 `glb`（引擎加载器只认 `fbx` / `glb` / `gltf`），VRM 身份由新增的 `AirDoc::vrm` 承载，只用于报告。
+- **VRM 识别不只看扩展名**：`util::sniff_container` 新增 `Container::Vrm`；`.vrm` 扩展名或 GLB JSON chunk 中出现 `"VRM"` / `"VRMC_vrm"` 声明都算 VRM。不少导出器把虚拟形象存成 `.glb`，只按扩展名判会漏。
+- **`src/vrm.rs`：VRM 专有内容识别与降级说明**：读取头像名 / 作者 / 授权 / 版本、`humanoid` 骨映射数量、MToon 材质数、表情数、spring bone 链数、lookAt 与缩略图，拼成一行摘要与逐类降级说明进 `issues`；**只进 `issues`、绝不进 `errors`**——VRM 专有语义缺失是能力边界，判成阻断级会让所有 VRM 都无法导出。
+- **三个入口全覆盖**：`list_assets` 扫描 `.vrm` 并在清单里标注 `VRM`；`inspect_asset` / `export_asset` / `preview_asset` / `view_render` / `open_viewport` 与命令 `export_engine_loader` 均可直接喂 `.vrm`；`asset3d-gui.exe` 的 `--standalone`、拖放、`O` 文件对话框与工作区扫描的过滤器接受 `.vrm`；`asset3d-retarget --target` 可指向虚拟形象（`--out` 仍只写 `.glb`）。
+- **面板概览写明规范**：`view_render` 的概览在 VRM 资产上多出「规范」「VRM」两行（如 `VRM 1.0` + 摘要），否则 `container` 一行恒为 `glb`，用户看不出这个文件是 VRM。
+- **未知扩展与 VRM 骨名不导致失败**：`extensionsUsed` 里的 VRM 族与非 VRM 扩展、`J_Bip_C_*` 一类非标准骨名，一律按普通 glTF 语义照读，不拒收、不报错。
+- **单测 +6 条**：`vrm` 侧覆盖 0.x/1.0 规范判定、只报 issue 不报 error、MToon/表情/spring bone 计数；`gltf` 侧覆盖「扩展声明被嗅探成 VRM」「`.vrm` 端到端可导入且无 errors」「普通 `.glb` 不被误判成 VRM」；`ui` 侧覆盖概览出现规范行、普通资产不出现 VRM 行。
+- **文档**：README 增补「VRM（`.vrm`）」小节（识别口径 + 逐项降级对照表），能力边界、`list_assets` 描述与「已知限制」同步更新；`asset3d-retarget` 帮助文案写明 `--target` 可传 `.vrm`。
 
 ## [0.4.0] - 2026-10-28
 
@@ -132,4 +145,5 @@ M-UI-4 第一刀：把动画从「只统计条数」推进到「能按时间点�
 ## [0.1.0]
 
 首个可用版本：`inspect_asset` / `export_asset` / `preview_asset` / `list_assets` / `export_engine_loader` 五个工具，FBX（ufbx）与 glTF/GLB 解析，AIR JSON / AIRB v1 二进制导出，离线 HTML + 数据分片预览，节点 TRS 不烘焙（顶点保持 mesh 局部空间）。
+*（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*

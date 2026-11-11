@@ -6,7 +6,7 @@
 //!    直接白屏，与「UI 不能卡死」的验收项冲突；
 //! 2. **有上限**：目录深度与条目数各有一道上限，超大工作区宁可截断也不能把
 //!    内存吃满（截断状态由 [`Scan::truncated`] 显式报给 UI，不静默吞掉）；
-//! 3. **只认三种资产**：`.glb` / `.gltf` / `.fbx`，与导入对话框、拖放判定同一口径。
+//! 3. **只认四种资产**：`.glb` / `.gltf` / `.vrm` / `.fbx`，与导入对话框、拖放判定同一口径。
 
 use std::path::{Path, PathBuf};
 
@@ -44,12 +44,12 @@ pub struct Scan {
     pub truncated: bool,
 }
 
-/// 扩展名判定：大小写不敏感，且只认 `.glb` / `.gltf` / `.fbx`。
+/// 扩展名判定：大小写不敏感，且只认 `.glb` / `.gltf` / `.vrm` / `.fbx`。
 pub fn is_asset(path: &Path) -> bool {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some(ext) => matches!(
             ext.to_ascii_lowercase().as_str(),
-            "glb" | "gltf" | "fbx"
+            "glb" | "gltf" | "vrm" | "fbx"
         ),
         None => false,
     }
@@ -151,6 +151,9 @@ mod tests {
         assert!(is_asset(Path::new("a.GLB")));
         assert!(is_asset(Path::new("a.gltf")));
         assert!(is_asset(Path::new("a.Fbx")));
+        // VRM 与 GLB 同一容器，工作区清单里必须能点开。
+        assert!(is_asset(Path::new("a.vrm")));
+        assert!(is_asset(Path::new("a.VRM")));
         assert!(!is_asset(Path::new("a.png")));
         assert!(!is_asset(Path::new("a")));
     }

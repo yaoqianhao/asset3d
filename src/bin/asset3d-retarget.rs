@@ -25,7 +25,8 @@ asset3d-retarget —— UE5 Mannequin 动作 → Tripo 人形角色 重定向
 
 必填:
   --source <path>        源动作文件（UE5 骨骼的 .glb / .fbx，如 Bow_Attack_Seq.glb）
-  --target <path>        目标角色（Tripo 绑定的 .glb，带 mesh + skin，可无动画）
+                         .vrm 作为源时按 GLB 解析，只取其中的动作轨（多数 VRM 不含动作）
+  --target <path>        目标角色（Tripo 绑定的 .glb，或 .vrm 虚拟形象；带 mesh + skin，可无动画）
   --out <path>           输出 .glb 路径（新文件，不会覆盖输入）
 
 选项:
